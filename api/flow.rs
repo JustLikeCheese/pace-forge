@@ -627,9 +627,28 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         }
     } else {
         log(&format!("[track] 规划 {}m，{} 个必经点…", p.distance_m, cps.len()));
+        // 没围栏时锚点可能只是调用方的兜底坐标（Web 写死 30.5,104.0），
+        // 离真实打卡点上千公里。闭环是「锚点 → 各打卡点 → 锚点」，锚点错了
+        // 就会报「最短闭环 1777736m」。打卡点是服务端给的真实位置，以它为准。
+        let (center_lat, center_lng) = match points::center_bd(&pt.coords) {
+            Some(c)
+                if crate::track::geo::distance(c, (p.center_lat, p.center_lng)) > 3000.0 =>
+            {
+                log(&format!(
+                    "⚠ [track] 锚点 ({:.4}, {:.4}) 离打卡点 {:.0}km，改用打卡点中心 ({:.4}, {:.4})",
+                    p.center_lat,
+                    p.center_lng,
+                    crate::track::geo::distance(c, (p.center_lat, p.center_lng)) / 1000.0,
+                    c.0,
+                    c.1
+                ));
+                c
+            }
+            _ => (p.center_lat, p.center_lng),
+        };
         let req = PlanRequest {
-            center_lat: p.center_lat,
-            center_lng: p.center_lng,
+            center_lat,
+            center_lng,
             checkpoints: cps.clone(),
             total_distance_m: p.distance_m,
             total_sec: p.duration_sec,
