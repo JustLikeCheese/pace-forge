@@ -163,36 +163,19 @@ pub fn step_buckets(
         .enumerate()
         .map(|(i, &steps)| {
             let begin = start_ms + i as i64 * 10_000;
-            // 桶内步频波动：切成 3 段（约 3.3 秒一段），算相邻差值统计。
-            //
-            // 原来是 vec![per3, per3, steps - 2*per3]——前两段完全相同，
-            // 于是相邻差的第一项恒为 0，minDiff **永远等于 0**，maxDiff 也
-            // 只有余数（≤3）。三个本该体现波动的字段结构性地退化成常量，
-            // 是比总量更好抓的机器指纹。
-            //
-            // 现在用桶内的自然起伏：三段按真实步频的呼吸节律分配，
-            // 用 steps 本身做确定性伪随机，同一桶重放结果一致。
-            let segs = split_into_segments(steps, 3, i as u64 ^ start_ms as u64);
-            let diffs: Vec<i32> = segs
-                .windows(2)
-                .map(|w| (w[1] - w[0]).abs())
-                .collect();
-            let max_diff = *diffs.iter().max().unwrap_or(&0);
-            let min_diff = *diffs.iter().min().unwrap_or(&0);
-            let avg_diff = if diffs.is_empty() {
-                0
-            } else {
-                diffs.iter().sum::<i32>() / diffs.len() as i32
-            };
+            // diff 三件套：真机每个桶恒为 avgDiff=0 / maxDiff=0 / minDiff=1000
+            // （6 条记录 581 个桶无一例外）。早先按桶内三段差值造「波动」想摆脱
+            // 指纹，但那是在没有真机数据时的推测——真机本就是这三个常量，
+            // 变化反而成了反向指纹。回到真机形态。
             StepBucket {
                 steps_num: steps,
                 begin_time: begin,
                 end_time: begin + 10_000,
                 flag: start_ms,
                 id: 0,
-                max_diff,
-                min_diff,
-                avg_diff,
+                max_diff: 0,
+                min_diff: 1000,
+                avg_diff: 0,
                 state: 0,
                 queue_num: 0,
             }
@@ -200,43 +183,6 @@ pub fn step_buckets(
         .collect()
 }
 
-/// 把 `total` 步切成 `n` 段，每段带自然起伏，总和精确等于 `total`。
-///
-/// 真人步频有呼吸节律（约 3~5 秒一个周期），桶内三段不会均匀。
-/// 这里按 ±12% 的确定性扰动分配，余数补给最大的那段保证总和不变。
-fn split_into_segments(total: i32, n: usize, seed: u64) -> Vec<i32> {
-    if n == 0 || total <= 0 {
-        return vec![0; n];
-    }
-    let mut st = seed | 1;
-    let mut raw: Vec<f64> = Vec::with_capacity(n);
-    let base = total as f64 / n as f64;
-    for _ in 0..n {
-        st ^= st >> 12;
-        st ^= st << 25;
-        st ^= st >> 27;
-        let r = (st.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64;
-        // ±12%，真实步频不会在一个 10 秒窗口里抖动超过这个量级
-        raw.push(base * (0.88 + r * 0.24));
-    }
-    let sum: f64 = raw.iter().sum();
-    let mut segs: Vec<i32> = raw.iter().map(|v| (v / sum * total as f64).round() as i32).collect();
-    // 最大余数法修正，保证总和精确
-    let mut diff = total - segs.iter().sum::<i32>();
-    let mut idx = 0usize;
-    while diff != 0 {
-        let step = if diff > 0 { 1 } else { -1 };
-        if segs[idx % n] + step >= 0 {
-            segs[idx % n] += step;
-            diff -= step;
-        }
-        idx += 1;
-        if idx > n * 8 {
-            break;
-        }
-    }
-    segs
-}
 
 /// 生成长度 `n` 的固定抖动序列（±`amp`），值域 [0.85, 1.15] 之外会被夹住。
 pub fn make_jitter(n: usize, amp: f64, seed: u64) -> Vec<f64> {
@@ -396,54 +342,19 @@ mod id_tests {
 mod diff_not_degenerate_tests {
     use super::*;
 
-    /// maxDiff/minDiff/avgDiff 必须真的体现波动。
+    /// diff 三件套必须与真机一致：恒为 avgDiff=0 / maxDiff=0 / minDiff=1000。
     ///
-    /// 原来用 vec![per3, per3, rest]，前两段相同 → 第一对差值恒为 0，
-    /// minDiff 永远是 0，maxDiff 只有余数（≤3）。这三个字段本该是
-    /// 桶内步频起伏的证据，退化成常量后比总量更好抓。
+    /// 实测 6 条真机记录 581 个桶，这三个字段无一例外是这三个常量。早先按
+    /// 「桶内波动」把它们做成变化的，反而和真机相反——真机本身就是常量。
     #[test]
-    fn diff_fields_are_not_always_zero() {
+    fn diff_fields_match_real_device() {
         let j = vec![1.0; 72];
         let b = step_buckets(0, 720, 1843, &j);
-        let mut nonzero_min = 0;
-        let mut max_seen = 0;
         for x in &b {
             assert!(x.steps_num > 0, "不该有空桶");
-            assert!(x.max_diff >= x.min_diff, "max 不能小于 min");
-            assert!(x.avg_diff >= 0);
-            if x.min_diff > 0 {
-                nonzero_min += 1;
-            }
-            max_seen = max_seen.max(x.max_diff);
-        }
-        // 10 秒 25 步切成三段约 8 步/段，两段相等是正常的，
-        // 所以只要求「有一部分桶的 minDiff > 0」——旧实现是 **恒等于 0**。
-        assert!(
-            nonzero_min > b.len() / 10,
-            "minDiff 应该有起伏，实际只有 {nonzero_min}/{} 个桶 > 0",
-            b.len()
-        );
-        // maxDiff 的真实量级就是 2~3（25 步切三段，每段 8 步左右），
-        // 但**分布不能是常量**——旧实现里 maxDiff 恒等于余数。
-        let uniq: std::collections::HashSet<i32> = b.iter().map(|x| x.max_diff).collect();
-        assert!(
-            uniq.len() > 1,
-            "maxDiff 退化成了常量 {max_seen}，应该有起伏"
-        );
-        // avgDiff 同样不能恒定
-        let uniq_avg: std::collections::HashSet<i32> = b.iter().map(|x| x.avg_diff).collect();
-        assert!(uniq_avg.len() > 1, "avgDiff 退化成了常量");
-    }
-
-    /// 三段步数之和必须精确等于桶步数。
-    #[test]
-    fn segments_sum_to_total() {
-        for total in [1, 7, 22, 25, 29, 100] {
-            for seed in 0..8u64 {
-                let segs = split_into_segments(total, 3, seed);
-                assert_eq!(segs.iter().sum::<i32>(), total, "total={total} seed={seed}");
-                assert!(segs.iter().all(|&s| s >= 0), "不能出现负段");
-            }
+            assert_eq!(x.avg_diff, 0, "真机 avgDiff 恒为 0");
+            assert_eq!(x.max_diff, 0, "真机 maxDiff 恒为 0");
+            assert_eq!(x.min_diff, 1000, "真机 minDiff 恒为 1000");
         }
     }
 }

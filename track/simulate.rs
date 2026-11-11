@@ -18,7 +18,7 @@
 //!
 //! 三个量由同一个速度序列派生，**互相自洽**，不存在对不上的可能。
 
-use super::biomech::{fatigue_from_km, ou_cadence_series};
+use super::biomech::{self, fatigue_from_km, ou_cadence_series};
 use super::buckets::{speed_buckets, SpeedBucket, StepBucket};
 use super::geo::{distance, path_length};
 use super::kinematics::{pace_profile, KinParams};
@@ -120,21 +120,24 @@ pub fn simulate(points: &[(f64, f64, i64)], p: &SimParams) -> Result<SimResult, 
             elapsed_km += v * dts[i - 1] / 1000.0;
         }
         let fat = fatigue_from_km(elapsed_km);
-        // 目标步频：来自真实记录拟合的 34.4 + 44.5v，带疲劳衰减
-        cad_targets.push(((34.4 + 44.5 * v) * (1.0 - 0.05 * fat)).clamp(100.0, 210.0));
+        // 目标步频：真机 6 条记录 / 560 分桶的对数回归（见 biomech::target_cadence），
+        // 带小幅疲劳衰减。旧的 34.4+44.5v 在慢配速处偏低 40~60 步，已废弃。
+        cad_targets.push((biomech::target_cadence(v) * (1.0 - 0.03 * fat)).clamp(120.0, 210.0));
     }
     let mut cadences = ou_cadence_series(
         &cad_targets,
         &dts,
         p.seed.wrapping_add(1),
-        // θ=0.07 → 相关时间 ≈14s。桶间隔 10s，e^(-0.7)≈0.5，相邻桶仍有明显惯性。
-        // 早先用 θ=0.20（相关时间 5s），10 秒粒度下已经衰减到 0.14，等于白噪声。
-        // θ=0.07（相关时间 14s）保留惯性；σ 必须够大，否则序列被积分平滑成
-        // 近乎常数（实测标准差 0.86 步 / 2.7%），真人 10 秒步数有 5~10% 抖动。
-        0.07,
-        3.2,
-        100.0,
-        215.0,
+        // θ、σ 来自真机：把步频减去「该速度的目标步频」得到残差，残差 sd≈20 步/分
+        // （≈3.4 步/10s）、lag-1 自相关≈0.21。按 AR(1) 反解得 θ≈0.078、σ≈6.3（dt=10s），
+        // 模拟验证 sd=20.5、ac=0.19，与真机吻合。
+        //
+        // 旧值 σ=3.2 把 10 秒步数抖动压到真机的一半，序列过于平滑——而原始步频序列
+        // 的总自相关（含速度剖面漂移）仍≈0.6，检测器看到的仍是真人量级，不受影响。
+        0.078,
+        6.3,
+        120.0,
+        232.0,
     );
 
     // ③ 步幅：由等式反解，保证 v = cadence/60 * stride 成立
@@ -271,25 +274,18 @@ fn distribute_steps(
         .enumerate()
         .map(|(i, b)| {
             let steps = counts[i].max(0);
-            let per3 = (steps as f64 / 3.0).round() as i32;
-            let thirds = [per3, per3, steps - 2 * per3];
-            let diffs: Vec<i32> = thirds.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
-            let max_diff = *diffs.iter().max().unwrap_or(&0);
-            let min_diff = *diffs.iter().min().unwrap_or(&0);
-            let avg_diff = if diffs.is_empty() {
-                0
-            } else {
-                diffs.iter().sum::<i32>() / diffs.len() as i32
-            };
+            // diff 三件套：真机每个桶恒为 avgDiff=0 / maxDiff=0 / minDiff=1000
+            // （6 条记录 581 个桶无一例外）。早先算桶内三段差值想造「波动」，
+            // 反而成了与真机相反的指纹。回到真机常量。
             StepBucket {
                 steps_num: steps,
                 begin_time: b.begin_time,
                 end_time: b.end_time,
                 flag: b.flag,
                 id: 0,
-                max_diff,
-                min_diff,
-                avg_diff,
+                max_diff: 0,
+                min_diff: 1000,
+                avg_diff: 0,
                 state: 0,
                 queue_num: 0,
             }
