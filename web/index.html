@@ -344,6 +344,13 @@ $('planBtn').onclick = async () => {
           : undefined
       })
     });
+    // 真实流程失败时后端回的是 {ok:false,error,logs}，没有轨迹字段，别按成功渲染
+    if (r.ok === false) {
+      setOut(r.error || '生成失败', true);
+      $('planOut').innerHTML = `<div class="msg err">生成失败</div>
+        <pre class="mono" style="font-size:11px;white-space:pre-wrap;max-height:300px;overflow:auto">${[r.error, '---', ...(r.logs || [])].join('\n')}</pre>`;
+      return;
+    }
     setOut('');
     const modeTxt = r.mode === 'stadium' ? `操场第 ${r.lane} 道`
       : (r.mode === 'draw' ? '手绘轨迹' : '自由路线');

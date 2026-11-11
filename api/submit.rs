@@ -82,10 +82,57 @@ pub struct Submission {
     pub canonical: String,
 }
 
+/// 两点间方位角（度，0=正北，顺时针），输入 (lat, lon)。
+fn bearing_deg(from: (f64, f64), to: (f64, f64)) -> f64 {
+    let (lat1, lat2) = (from.0.to_radians(), to.0.to_radians());
+    let dlon = (to.1 - from.1).to_radians();
+    let y = dlon.sin() * lat2.cos();
+    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
+    let deg = y.atan2(x).to_degrees();
+    (deg + 360.0) % 360.0
+}
+
+/// 毫秒时间戳格式化成真机 `gainTime` 的 "YYYY-MM-DD HH:MM:SS"（本地时区）。
+fn fmt_run_time(ms: i64) -> String {
+    let secs = ms / 1000 + tz_offset_sec();
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    // Howard Hinnant civil_from_days
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+/// 服务端本地时区偏移（秒），默认 UTC+8，`PACE_TZ_OFFSET_SEC` 可覆盖。
+fn tz_offset_sec() -> i64 {
+    std::env::var("PACE_TZ_OFFSET_SEC")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| (-72_000..=72_000).contains(v))
+        .unwrap_or(8 * 3600)
+}
+
 /// 单个轨迹点在 `allLocJson` 里的完整结构。
 ///
-/// 字段名与语义对齐服务端：`lat`/`lng` 是**占位**（固定 -1.0），真实坐标走
-/// `gLat`/`gLng` 且必须是 gcj02；`speed` 单位 km/h，`avgSpeed` 单位 m/s。
+/// 字段语义与值域对齐**真机 6 条记录 / 1220 个采样点**（从 OBS `allLocJson`
+/// 还原）：
+/// - `lat`/`lng` 真机恒为 **-1.0**，真实坐标只走 `gLat`/`gLng`（gcj02）。服务端
+///   点位判定读的是 `gLat/gLng`，不是 `lat/lng`——这一点早先猜反过。
+/// - `flag` 真机**每个点都等于起跑毫秒戳**（恒定），逐点时间在 `gainTime`
+///   （可读串）+ `totalTime`（累计秒）里，不在 flag。
+/// - `count`（卫星数）真机 10~34、均值≈28；`bdD`（航向角）0~360 真实变化；
+///   `bdS`（瞬时 m/s）0~4.8；`radius`（精度）聚在 ~3.8m；`gainTime` 非空。
+///   这些真机里都是变化/非零量，早先的恒定值（1 / 0 / 1.0 / ""）是机器指纹。
+/// - `speed` 单位 km/h，`avgSpeed` 单位 m/s。
 #[allow(clippy::too_many_arguments)]
 pub fn point_json_full(
     p: &TrackPoint,
@@ -102,6 +149,7 @@ pub fn point_json_full(
 ) -> Value {
     // BD-09 → GCJ-02（原点是 BD-09，服务端要 gcj02）
     let (glat, glng) = crate::api::coord::bd09_to_gcj02(p.lat, p.lon);
+    let prev_pt = *prev; // 捕获上一点坐标（下面会被更新），用于算航向
 
     // 累计量
     let step_m = if idx == 0 {
@@ -169,25 +217,48 @@ pub fn point_json_full(
         }
     };
 
-    // GPS 精度半径
+    // GPS 精度半径：真机聚在 ~3.8m，不是早先的 1.5~3.0。小幅抖动。
     let h2 = (p.lon.to_bits() ^ seed).wrapping_mul(6364136223846793005);
-    let radius = 1.5 + ((h2 >> 40) % 150) as f64 / 100.0;
+    let radius = (3.6 + ((h2 >> 40) % 70) as f64 / 100.0).clamp(3.0, 6.0);
 
-    // 海拔。
+    // 卫星数：真机 10~34、均值≈28，逐点平滑游走，不是恒 1。
+    let h3 = (idx as u64).wrapping_mul(0x2545F4914F6CDD1D) ^ seed;
+    let count = (24 + ((h3 >> 32) % 11) as i64).clamp(10, 34);
+
+    // 瞬时速度 m/s（bdS）：真机 0~4.8，和瞬时配速同源但单位不同。
+    let inst_mps = if idx == 0 {
+        0.0
+    } else {
+        (step_m / gap_sec).clamp(0.0, 5.0)
+    };
+
+    // 航向角 bdD（度）：真机 0~360 真实变化，早先恒 0 是指纹。
+    let bearing = if idx == 0 {
+        0.0
+    } else {
+        bearing_deg(prev_pt, (p.lat, p.lon))
+    };
+
+    // 定位时刻 gainTime：真机是可读时间串，早先空串是指纹。
+    let gain_time = fmt_run_time(p.time_ms);
+
+    // 海拔 bdA。
     //
-    // 原来写死 1.0，注释理由是「不能是 0，否则等于在海底跑」。但恒 1.0
-    // 同样不真实——服务端按相邻两点海拔差累计爬升，全程零爬升、且亮度
-    // 停在 1 米，是「这个点没有海拔数据」的典型特征。
+    // 真机实测：单条 2km 记录内海拔在 20~64m 间起伏，每公里累计爬升 50+m——
+    // 这是**气压计/GPS 高程的传感器噪声**，不是真实地形（平地校园）。早先用
+    // 130m 基准 + 亚米漂移，累计爬升近乎 0，是「没有海拔数据」的典型特征，
+    // 和真机差一个数量级。
     //
-    // 用围栏中心纬经度派生一个基础海拔（同一校区稳定），再叠一层缓慢
-    // 漂移：相邻点之间变化很小（真实 GPS 高程是连续量），整条轨迹有
-    // 几十厘米的起伏，累计爬升落在个位数到十几米，与平地校园一致。
-    // 自变量必须是**平滑量**（累计里程），不能用坐标的小数位——
-    // 纬度的 fract 是高频噪声，跑一步就跳十几米，比自己写的假数据还假。
-    // 两个正弦的周期分别是约 2.1km 和 5.7km，整条轨迹就是一段缓坡。
-    let base_alt = 130.0 + (cum.0 * 0.003).sin() * 3.0 + (cum.0 * 0.0011).cos() * 2.0;
-    let drift = (idx as f64 * 0.037).cos() * 0.4;
-    let altitude = (base_alt + drift).max(0.0);
+    // 这里用多尺度确定性噪声（三条不同周期的正弦，相位由 seed 定）叠在
+    // ~35m 基准上：高频项提供相邻点 ~1m 的抖动，低频项提供整条几十米的漂移，
+    // 累计爬升落在真机量级（2km 约百米）。同 seed 可复现。
+    let ph = |k: u64| (((seed ^ k).wrapping_mul(0x9E3779B97F4A7C15) >> 40) as f64) / 16_777_216.0 * std::f64::consts::TAU;
+    let fi = idx as f64;
+    let altitude = (35.0
+        + 9.0 * (fi * 0.075 + ph(1)).sin()
+        + 5.0 * (fi * 0.21 + ph(2)).sin()
+        + 3.0 * (fi * 0.54 + ph(3)).sin())
+    .max(1.0);
 
     // 局部步幅：本段位移 / 本段步数。原来那个表达式化简后是
     // 「累计里程 / 全程步数」，单调递增的累积平均值，不是即时步幅。
@@ -201,57 +272,51 @@ pub fn point_json_full(
 
     json!({
         "avgSpeed": (avg_speed * 10000.0).round() / 10000.0,
-        // 海拔三兄弟不能是 0：服务端按它们算累计爬升，全 0 等于「在海底跑」
         "bdA": (altitude * 10.0).round() / 10.0,
-        "bdD": 0.0,
+        "bdD": (bearing * 10.0).round() / 10.0,
         "bdG": 1,
-        "bdS": 1.0,
+        "bdS": (inst_mps * 100.0).round() / 100.0,
         "coorType": "gcj02",
-        "count": 1,
+        "count": count,
         "dtr": 0.0,
-        // flag 是**这个采样点的定位时刻**，不是整条轨迹的开始时刻。
+        // flag：真机每个采样点的 flag 都等于**起跑毫秒戳**（恒定）。
         //
-        // 原来这里写死 start_ms，419 个点的 flag 全一样。App 画轨迹时
-        // 按 flag 排点、按相邻两点的 flag 差算时间间隔——全部相等等于
-        // 「所有点同时定位」，折线拿不到任何时间维度的信息，地图上就
-        // 只剩里程/时长/配速这些标量，画不出线。表现是记录点进去只有
-        // 数据、没有轨迹，一看就是刷的。
+        // 实测 6 条记录、1220 个点，每条的 flag 都只有 1 个不同值 = 首点
+        // 起跑时刻。逐点时间不在 flag，而在 gainTime（可读串）+ totalTime
+        // （累计秒）里。早先把 flag 改成逐点 p.time_ms 是为了让 App 画线，
+        // 但 TRAJECTORY-DISPLAY 已证明 App 根本不从 OBS 取轨迹（读本地库），
+        // 那个改动既无必要又与真机不一致，故回到真机形态。
         //
-        // verify_view 也从首点 flag 反解 startTime，说明这个字段本来就
-        // 是绝对毫秒时间戳，与 totalTime（累计秒）不是一回事。
-        "flag": p.time_ms,
+        // verify_view 从 totalTime 反解时间，不读 flag，所以恒定 flag 不影响自检。
+        "flag": start_ms,
         "gLat": (glat * 1e7).round() / 1e7,
         "gLng": (glng * 1e7).round() / 1e7,
-        "gainTime": "",
+        "gainTime": gain_time,
         "id": idx as i64 + 1,
-        // lat/lng 必须是真的 BD-09 坐标。
+        // lat/lng：真机恒为 **-1.0**，真实坐标只在 gLat/gLng。
         //
-        // 这里原来写死 -1.0，只有 gLat/gLng 带真坐标。服务端按点位判定时
-        // 读的是 lat/lng，拿到 -1 就等于每个采样点都不在任何打卡点附近，
-        // 「按顺序通过所有点位」永远不会成立——轨迹明明精确穿过（最近
-        // 0.1m），六条记录全是 False。
-        "lat": (p.lat * 1e7).round() / 1e7,
-        "lng": (p.lon * 1e7).round() / 1e7,
+        // 早先改成真 BD-09 坐标，猜测「服务端按 lat/lng 判点位」，想修
+        // type=9；但 TYPE9-NOTES 记录改完后 type=9「仍 false」，且 6 条真机
+        // 记录的 lat/lng 全是 -1。服务端点位判定读的是 gLat/gLng（gcj02），
+        // 不是 lat/lng。回到真机形态：-1 占位。
+        "lat": -1.0,
+        "lng": -1.0,
         "locType": 1,
         "locationId": "",
-        "queueNum": idx as i32,
+        // queueNum：真机恒为 0（点序在 id 里），早先用 idx 是指纹。
+        "queueNum": 0,
         "radius": (radius * 100.0).round() / 100.0,
         "speed": (inst * 10000.0).round() / 10000.0,
-        // state 是速度合规三态（0=合规 / 1=慢于下限 / 2=快于上限）。
-        // 原来首点硬编码成 1，理由是"起步速度 0 必然慢于下限"。但 state
-        // 不是纯展示字段——它参与「这个采样点算不算有效经过」的判定，
-        // 而起点往往就是 0 号打卡点，于是 0 号点带着 state=1 被跳过，
-        // 「按顺序通过所有点位」永远拼不齐。
-        //
-        // 真机首点 GPS 速度记 0 但 state 标 0（定位刚锁定，还没进速度
-        // 判定窗口）。这里跟随：首点记 0，其余按瞬时速度与允许区间比。
+        // state：真机采样点 state ∈ {1,2,3}，**从不为 0**（1220 个点统计：
+        // 1 占 87%、3 占 12%、2 极少），首点也是 1。早先用 {0,1,2} 且首点 0，
+        // 与真机相反。对齐真机：常态 1，快于上限 2，慢于下限 3；首点 1。
         "state": if idx == 0 {
-            0
+            1
         } else {
             let lo = 1.39;
             let hi = 8.33;
             let v = step_m / gap_sec;
-            if v < lo { 1 } else if v > hi { 2 } else { 0 }
+            if v > hi { 2 } else if v < lo { 3 } else { 1 }
         },
         "steps": ((total_steps as f64) * (idx as f64 + 1.0) / n as f64).round() as i64,
         // 局部步幅 = 本段位移 / 本段步数。
@@ -1176,9 +1241,9 @@ mod point_shape_tests {
         TrackPoint { lat, lon, time_ms: t }
     }
 
-    /// 每个采样点的 `flag` 必须是它自己的定位时刻，不能整条轨迹一个值。
+    /// 每个采样点的 `flag` 必须恒等于起跑毫秒戳（真机形态）。
     #[test]
-    fn flag_advances_per_point() {
+    fn flag_is_constant_start() {
         let pts: Vec<TrackPoint> = (0..10)
             .map(|i| tp(31.2304 + i as f64 * 2e-4, 121.4737, 1_790_000_000_000 + i * 5000))
             .collect();
@@ -1188,20 +1253,16 @@ mod point_shape_tests {
         let s = sub.save_record["allLocJson"].as_str().unwrap();
         let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
 
-        // 全同 = App 拿不到时间维度的信息，画不出折线，记录只剩标量数据
+        // 真机 6 条记录 1220 个点，每条 flag 只有 1 个值 = 起跑时刻。
         let flags: Vec<i64> = arr.iter().map(|p| p["flag"].as_i64().unwrap()).collect();
         assert!(
-            flags.windows(2).all(|w| w[1] > w[0]),
-            "flag 必须逐点递增，实际 {flags:?}"
+            flags.iter().all(|&f| f == params.start_time_ms),
+            "flag 必须恒等于 startTime，实际 {flags:?}"
         );
-        // 首点就是 startTime，verify_view 反过来靠它反解
-        assert_eq!(flags[0], params.start_time_ms, "首点 flag 应等于 startTime");
-        // 与 totalTime 同源：末点累计秒对应的时间戳要对得上
-        let last_total_time = arr.last().unwrap()["totalTime"].as_i64().unwrap();
-        assert_eq!(
-            flags.last().unwrap() - flags[0],
-            last_total_time * 1000,
-            "flag 跨度应与 totalTime 一致"
+        // 逐点时间走 gainTime（非空）+ totalTime，不在 flag
+        assert!(
+            arr.iter().all(|p| !p["gainTime"].as_str().unwrap_or("").is_empty()),
+            "gainTime 不能为空"
         );
     }
 
@@ -1246,21 +1307,10 @@ mod point_shape_tests {
         assert_eq!(arr.len(), 3);
 
         let p0 = &arr[0];
-        // lat/lng 是真实 BD-09，不是占位符。
-        //
-        // 这个断言原来写的是 `assert_eq!(p0["lat"], -1.0)`，把 bug 当成了
-        // 规格：服务端按 lat/lng 判点位，-1 等于每个采样点都不在打卡点附近，
-        // 「按顺序通过所有点位」永远 False。
-        assert!(
-            (p0["lat"].as_f64().unwrap() - 31.2304).abs() < 1e-6,
-            "lat 应是原始 BD-09 坐标，实际 {:?}",
-            p0["lat"]
-        );
-        assert!(
-            (p0["lng"].as_f64().unwrap() - 121.4737).abs() < 1e-6,
-            "lng 应是原始 BD-09 坐标，实际 {:?}",
-            p0["lng"]
-        );
+        // lat/lng 真机恒为 -1.0，真实坐标只在 gLat/gLng（gcj02）。
+        // 服务端点位判定读 gLat/gLng，不是 lat/lng（见 point_json_full 文档）。
+        assert_eq!(p0["lat"].as_f64().unwrap(), -1.0, "lat 应为真机占位 -1.0");
+        assert_eq!(p0["lng"].as_f64().unwrap(), -1.0, "lng 应为真机占位 -1.0");
         // 另一套坐标在 gLat/gLng，已转到 gcj02
         assert!(p0["gLat"].as_f64().unwrap() > 31.0);
         assert!(p0["gLng"].as_f64().unwrap() > 121.0);
