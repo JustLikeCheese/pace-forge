@@ -192,7 +192,18 @@ button.danger:disabled{opacity:.5}
         <option>5</option><option>6</option><option>7</option><option>8</option>
       </select></label>
       <label>距离 km<input id="rDist" type="number" value="2.0" step="0.1" min="0.5" max="21"></label>
-      <label>时长 分<input id="rDur" type="number" value="12" step="1" min="3" max="180"></label>
+      <label>配速 分/km
+        <span style="display:inline-flex;gap:4px;align-items:center">
+          <input id="rPaceMin" type="number" value="5.5" step="0.1" min="2" max="12" style="width:64px">
+          ~
+          <input id="rPaceMax" type="number" value="6.6" step="0.1" min="2" max="12" style="width:64px">
+        </span>
+      </label>
+      <label title="按上面的配速区间随机取一个配速，乘距离得到时长；每次提交都重新随机">
+        <input id="rAutoDur" type="checkbox" checked> 时长自动
+        <span id="durHint" class="hint"></span>
+      </label>
+      <label>时长 分<input id="rDur" type="number" value="12" step="0.1" min="3" max="180" readonly></label>
       <label>步数<input id="rSteps" type="number" step="10" min="100" placeholder="留空按配速自动推算"></label>
       <label>何时跑<select id="rWhen">
         <option value="now">现在</option>
@@ -212,6 +223,12 @@ button.danger:disabled{opacity:.5}
         <button id="drawClear" class="ghost">清空</button>
         <button id="drawUse">用这条轨迹</button>
         <span id="drawInfo" class="hint" style="margin-left:8px"></span>
+      </div>
+      <div id="blockWrap" style="flex-basis:100%;margin-top:6px">
+        <button id="blockStart" class="ghost">标注禁区（画楼）</button>
+        <button id="blockUndo" class="ghost">撤销上一块</button>
+        <button id="blockSave" class="ghost">保存禁区</button>
+        <span id="blockInfo" class="hint"></span>
       </div>
       <button id="planBtn">生成轨迹</button>
       <button id="runBtn" class="danger">真的跑（提交）</button>
@@ -317,11 +334,63 @@ $('rMode').onchange = () => {
   }
 };
 
+/* ---------- 时长自动生成 ----------
+ * 每次都 12:00 整，时长一模一样，一眼就是脚本。改成按配速区间随机：
+ *   duration(分) = 距离(km) × 配速(分/km)，配速在 [min, max] 里均匀取
+ * 5.5~6.6 分/km 跑 2 km 就是 11:00~13:12，天然浮动。
+ */
+function paceRange() {
+  const a = parseFloat($('rPaceMin').value);
+  const b = parseFloat($('rPaceMax').value);
+  const lo = Number.isFinite(a) && a >= 2 && a <= 12 ? a : 5.5;
+  const hi = Number.isFinite(b) && b >= 2 && b <= 12 ? b : 6.6;
+  return [Math.min(lo, hi), Math.max(lo, hi)];
+}
+
+function autoDur(dist) {
+  const [lo, hi] = paceRange();
+  const pace = lo + Math.random() * (hi - lo);
+  // 落到 1 秒粒度，看起来就是真跑出来的
+  return Math.max(3, Math.round(dist * pace * 60) / 60);
+}
+
+function fmtPaceMin(v) {
+  if (!(v > 0)) return '—';
+  const m = Math.floor(v), sec = Math.round((v - m) * 60);
+  return m + "'" + String(sec).padStart(2, '0') + '"';
+}
+
+/// 取本次要用的时长（分钟）。勾了自动就现随机一个并回填输入框。
+function readDur(dist) {
+  if (!$('rAutoDur').checked) return parseFloat($('rDur').value) || 0;
+  const d = autoDur(dist);
+  $('rDur').value = d.toFixed(2);
+  return d;
+}
+
+function syncDurHint() {
+  const auto = $('rAutoDur').checked;
+  $('rDur').readOnly = auto;
+  if (auto) {
+    const dist = parseFloat($('rDist').value) || 2;
+    const [lo, hi] = paceRange();
+    $('durHint').textContent = `（${fmtPaceMin(lo)}~${fmtPaceMin(hi)}/km → ${(dist * lo).toFixed(1)}~${(dist * hi).toFixed(1)} 分）`;
+  } else {
+    $('durHint').textContent = '';
+  }
+}
+
+['rAutoDur', 'rPaceMin', 'rPaceMax', 'rDist'].forEach(id => {
+  const el = $(id);
+  if (el) { el.oninput = syncDurHint; el.onchange = syncDurHint; }
+});
+syncDurHint();
+
 $('planBtn').onclick = async () => {
   let st = null;
   try { st = await resolveStartAt(); } catch (e) { if (e.message !== '已取消') setOut(e.message, true); return; }
   const dist = parseFloat($('rDist').value);
-  const dur = parseFloat($('rDur').value);
+  const dur = readDur(dist);
   const stepsRaw = $('rSteps').value.trim();
   const steps = stepsRaw === '' ? null : parseInt(stepsRaw, 10);
   if (!(dist > 0) || !(dur > 0)) return setOut('距离和时长要填正数', true);
@@ -437,7 +506,7 @@ $('semBtn').onclick = async () => {
 /* ---------- 真跑 ---------- */
 $('runBtn').onclick = async () => {
   const dist = parseFloat($('rDist').value);
-  const dur = parseFloat($('rDur').value);
+  const dur = readDur(dist);
   if (!(dist > 0) || !(dur > 0)) return setOut('距离和时长要填正数', true);
   const mode = parseInt($('rRunMode').value, 10) || 1;
   const modeName = {1: '记分跑', 2: '户外跑', 3: '室外锻炼'}[mode];
@@ -709,7 +778,7 @@ $('accLoginAll').onclick = async () => {
 
 $('accBatch').onclick = async () => {
   const dist = parseFloat($('rDist').value);
-  const dur = parseFloat($('rDur').value);
+  const dur = readDur(dist);
   const mode = parseInt($('rRunMode').value, 10) || 1;
   const modeName = {1: '记分跑', 2: '户外跑', 3: '室外锻炼'}[mode];
   if (!(dist > 0) || !(dur > 0)) { $('accMsg').textContent = '先在上面的表单填好距离和时长'; return; }
@@ -781,6 +850,7 @@ function initMap() {
     { position: 'topright' }).addTo(map);
   layer = L.layerGroup().addTo(map);
   initDrawing();
+  initBlockers();
 }
 
 
@@ -881,6 +951,84 @@ function useDrawing() {
   return merged;
 }
 
+/* ---------- 禁区标注 ----------
+ * OSM 在国内校园基本是空白（实测这个校区整个 bbox 只有 15 个 way、76 个
+ * node，一栋楼都没有），Overpass 拉不到建筑轮廓，轨迹就只能按几何直线走，
+ * 从教学楼、宿舍楼中间穿过去。
+ *
+ * 这里让人在地图上圈一次：拖出矩形盖住楼，存到本地 blockers.json，
+ * 之后所有规划都会绕开（fence_route::avoid_blockers）。
+ */
+let blockMode = false, blockStart = null, blockTemp = null, localBlockers = [];
+let blockLayer = null;
+
+function blockerRectFromBounds(b) {
+  return [
+    [b.getSouth(), b.getWest()],
+    [b.getSouth(), b.getEast()],
+    [b.getNorth(), b.getEast()],
+    [b.getNorth(), b.getWest()],
+  ];
+}
+
+function drawBlockers() {
+  if (!blockLayer) return;
+  blockLayer.clearLayers();
+  localBlockers.forEach(poly => {
+    L.polygon(poly, { color: '#f85149', weight: 2, dashArray: '5 3', fillOpacity: .18 })
+      .addTo(blockLayer);
+  });
+  const n = localBlockers.length;
+  $('blockInfo').textContent = blockMode
+    ? (n ? `拖拽继续圈，共 ${n} 块；画完点「保存禁区」` : '在地图上按住拖出一个矩形，把楼盖住')
+    : (n ? `已标注 ${n} 块禁区（轨迹会绕开）` : '还没标注禁区');
+}
+
+function setBlockMode(v) {
+  blockMode = v;
+  $('blockStart').textContent = v ? '停止标注' : '标注禁区（画楼）';
+  if (map) map.getContainer().style.cursor = v ? 'crosshair' : '';
+  if (!v && blockTemp) { blockTemp.remove(); blockTemp = null; }
+  blockStart = null;
+  drawBlockers();
+}
+
+async function loadBlockers() {
+  try {
+    const r = await api('/api/blockers');
+    localBlockers = (r.polys || []).map(p => p.map(q => [q[0], q[1]]));
+    drawBlockers();
+  } catch (e) {
+    $('blockInfo').textContent = '读取已存禁区失败：' + e.message;
+  }
+}
+
+function initBlockers() {
+  if (!map || map.__blockBound) return;
+  map.__blockBound = true;
+  blockLayer = L.layerGroup().addTo(map);
+  $('blockStart').onclick = () => setBlockMode(!blockMode);
+  $('blockUndo').onclick = () => {
+    if (!localBlockers.length) return;
+    localBlockers.pop();
+    drawBlockers();
+  };
+  $('blockSave').onclick = async () => {
+    try {
+      const r = await api('/api/blockers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ polys: localBlockers }),
+      });
+      $('blockInfo').textContent = `已保存 ${r.saved} 块禁区，之后的轨迹会绕开`;
+      setBlockMode(false);
+    } catch (e) {
+      $('blockInfo').textContent = '保存失败：' + e.message;
+    }
+  };
+  loadBlockers();
+}
+
 function initDrawing() {
   if (!map || map.__drawBound) return;
   map.__drawBound = true;
@@ -892,6 +1040,14 @@ function initDrawing() {
   };
 
   el.addEventListener('pointerdown', ev => {
+    if (blockMode) {
+      ev.preventDefault();
+      blockStart = toLatLng(ev);
+      blockTemp = L.rectangle(L.latLngBounds(blockStart, blockStart), {
+        color: '#f85149', weight: 2, fillOpacity: .2,
+      }).addTo(map);
+      return;
+    }
     if (!drawMode) return;
     ev.preventDefault();
     isPointerDown = true;
@@ -903,6 +1059,10 @@ function initDrawing() {
   });
 
   el.addEventListener('pointermove', ev => {
+    if (blockMode && blockStart && blockTemp) {
+      blockTemp.setBounds(L.latLngBounds(blockStart, toLatLng(ev)));
+      return;
+    }
     if (!drawMode || !isPointerDown || !currentStroke) return;
     ev.preventDefault();
     const ll = toLatLng(ev);
@@ -914,6 +1074,19 @@ function initDrawing() {
   });
 
   const finish = ev => {
+    if (blockMode && blockStart && blockTemp) {
+      const b = blockTemp.getBounds();
+      blockTemp.remove();
+      blockTemp = null;
+      blockStart = null;
+      // 太小的当成误点，不记
+      const dN = metersBetween([b.getSouth(), b.getWest()], [b.getNorth(), b.getEast()]);
+      if (dN >= 8) {
+        localBlockers.push(blockerRectFromBounds(b));
+        drawBlockers();
+      }
+      return;
+    }
     if (!isPointerDown) return;
     isPointerDown = false;
     currentStroke = null;
@@ -1001,6 +1174,37 @@ function recHtml(r, i) {
   </div>`;
 }
 
+/* ---------- 从 OBS 拉轨迹 ----------
+ * 服务端详情接口对工具提交的记录不返回坐标（jsonFromObs=1 → App 查本地库），
+ * 但轨迹对象确实在对象存储里，key 规则是 run_data/{rrid/1000000}/{rrid}.json。
+ * 用后端 /api/obs/fetch 换 Get 签名下载，浏览器侧用 DecompressionStream('gzip')
+ * 解压，再取 run_data.allLocJson。
+ */
+async function ungzipB64(b64) {
+  const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const out = new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return await new Response(out).text();
+}
+
+async function obsTrack(rrid) {
+  const key = 'run_data/' + Math.floor(rrid / 1000000) + '/' + rrid + '.json';
+  try {
+    const j = await api('/api/obs/fetch', { method: 'POST', body: JSON.stringify({ key }) });
+    const obj = j.data ?? j;
+    if (!obj || !obj.run_data) return null;
+    const wrap = JSON.parse(await ungzipB64(obj.run_data));
+    const raw = wrap.allLocJson;
+    const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!Array.isArray(arr)) return null;
+    // gLat/gLng 是 GCJ-02，lat/lng 是 BD-09；底图按 GCJ-02 走更贴合
+    return arr
+      .map(p => ({ lat: num(p.gLat) || num(p.lat), lng: num(p.gLng) || num(p.lng) }))
+      .filter(p => p.lat && p.lng);
+  } catch (e) {
+    return null;
+  }
+}
+
 /* ---------- 单条详情 ---------- */
 async function selectRec(r, el) {
   document.querySelectorAll('.rec').forEach(x => x.classList.remove('sel'));
@@ -1012,7 +1216,15 @@ async function selectRec(r, el) {
 
   try {
     const d = await api('/api/record/' + rrid);
-    const pts = findTrack(d);
+    let pts = findTrack(d);
+    // 服务端详情不带轨迹点（jsonFromObs=1 时 App 也去查手机本地库），
+    // 但轨迹对象一直在 OBS 里：key 是 run_data/{rrid/1000000}/{rrid}.json。
+    // 拉下来 → gzip 解压 → 取 run_data.allLocJson → 就能画线。
+    if (pts.length <= 1) {
+      $('detail').innerHTML = '<span class="spin"></span> 从 OBS 拉轨迹…';
+      const obs = await obsTrack(rrid);
+      if (obs && obs.length > 1) pts = obs;
+    }
     if (pts.length > 1) {
       const line = L.polyline(pts, { color: '#4493f8', weight: 4, opacity: .9 }).addTo(layer);
       L.circleMarker(pts[0], { radius: 6, color: '#3fb950', fillOpacity: 1 }).addTo(layer);
@@ -1023,9 +1235,9 @@ async function selectRec(r, el) {
     } else {
       map.setView([30.5, 104.0], 15);
       $('detail').innerHTML = detailHtml(d, 0) +
-        '<div style="margin-top:8px;color:var(--dim)">服务端不返回轨迹点：' +
-        'App 画线读的是手机本地 RunData 库（jsonFromObs=1 时查本地，无网络回落），' +
-        '所以这里和 App 里都看不到线，属正常，不是上传失败。</div>';
+        '<div style="margin-top:8px;color:var(--dim)">OBS 里也没有这条记录的轨迹对象：' +
+        '要么当时上传失败，要么 objectKey 对不上（旧版时区不稳，实测 11-07 那批 ' +
+        'UTC+8 的 key 全是 404）。这条记录在哪儿都画不出线。</div>';
     }
   } catch (e) {
     $('detail').innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';

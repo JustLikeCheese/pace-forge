@@ -407,7 +407,9 @@ mod tests {
             sim,
             params: sp,
             checkpoints: cps,
-            total_distance_m: 2000,
+            // 必须和合成轨迹一致：SIM_DIST 检查的是「报文里程 vs 轨迹实测」，
+            // 两者本来就该相等（flow 里报文直接用 real_len）。
+            total_distance_m: sim.actual_length_m.round() as i64,
             total_time_sec: 720,
             total_steps: 2300,
             start_time_ms: 1_730_000_000_000,

@@ -384,6 +384,11 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
         }
         (Method::Get, "/api/fences") => handle_fences(request, state, &query),
         (Method::Get, "/api/records") => handle_records(request, state, &query),
+        (Method::Get, "/api/blockers") => handle_blockers_get(request),
+        (Method::Post, "/api/blockers") => {
+            let body = read_json(&mut request)?;
+            handle_blockers_put(request, &body)
+        }
         (Method::Post, "/api/obs/fetch") => {
             let body = read_json(&mut request)?;
             handle_obs_fetch(request, state, &body)
@@ -1558,8 +1563,63 @@ fn handle_run(
 
 /// 按 rrid 从 OBS 拉历史记录的原始轨迹。
 ///
-/// 轨迹不在 `get_one_record` 里返回（那个接口的 allLocJson 永远是 null），
+/// 轨迹不在 `get_one_record` 里返回（实测 50 条记录该字段全为 null），
 /// 但记录列表带了 uuid 和 startTime，拼出 objectKey 就能直接从 OBS 取。
+/// App 自己走不走这条路还没定论，见 TRAJECTORY-DISPLAY.md。
+/// 读本地手绘禁区。
+fn handle_blockers_get(request: tiny_http::Request) -> Result<(), String> {
+    let polys = crate::track::roadnet::load_local_blockers();
+    json_ok(
+        request,
+        json!({
+            "count": polys.len(),
+            "polys": polys
+                .iter()
+                .map(|p| p.iter().map(|q| vec![q.0, q.1]).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        }),
+    )
+}
+
+/// 保存本地手绘禁区。body: {"polys":[[[lat,lng],...], ...]}
+///
+/// 用法：OSM 在国内校园没有建筑轮廓，规划出来的轨迹会从楼里穿过去。
+/// 在地图上把楼圈成矩形，存一份，之后所有规划都会绕开。
+fn handle_blockers_put(request: tiny_http::Request, body: &Value) -> Result<(), String> {
+    let Some(arr) = body.get("polys").and_then(|v| v.as_array()) else {
+        return json_err(request, "polys 必须是数组");
+    };
+    if arr.len() > 200 {
+        return json_err(request, "禁区最多 200 块");
+    }
+    let mut polys: Vec<Vec<(f64, f64)>> = Vec::new();
+    for poly in arr {
+        let Some(pts) = poly.as_array() else {
+            return json_err(request, "每块禁区要是 [[lat,lng], ...]");
+        };
+        let pts: Vec<(f64, f64)> = pts
+            .iter()
+            .filter_map(|p| {
+                let a = p.as_array()?;
+                Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?))
+            })
+            .collect();
+        if pts.len() < 3 {
+            return json_err(request, "每块禁区至少要 3 个点");
+        }
+        for p in &pts {
+            if !(-90.0..=90.0).contains(&p.0) || !(-180.0..=180.0).contains(&p.1) {
+                return json_err(request, "坐标超出经纬度范围");
+            }
+        }
+        polys.push(pts);
+    }
+    match crate::track::roadnet::save_local_blockers(&polys) {
+        Ok(()) => json_ok(request, json!({"saved": polys.len()})),
+        Err(e) => json_err(request, &e),
+    }
+}
+
 fn handle_obs_fetch(
     request: tiny_http::Request,
     state: Shared,

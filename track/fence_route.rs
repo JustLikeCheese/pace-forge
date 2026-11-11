@@ -100,6 +100,255 @@ fn scan_intersections(poly: &[(f64, f64)], lat: f64) -> Vec<f64> {
     xs
 }
 
+
+// ============ 障碍避让（建筑、水体） ============
+//
+// 几何规划是把打卡点按顺序用弧线串起来，纯几何，不看地面有什么。校区里
+// 打卡点分属不同楼群，弧线直接从楼中间穿过去，地图上一眼假。
+//
+// 做法分两层：
+//   1. 逐点：落在多边形内部的点，沿最近边推到边界外 margin
+//   2. 逐段：线段横穿多边形（两端都在外面）时，插一段贴边绕行
+// 第二层是必须的——采样间隔 8m，30m 宽的楼可能两端都在外面而中间穿墙。
+
+/// 点是否严格落在多边形内部（射线法）。
+pub fn point_in_poly(poly: &[(f64, f64)], p: (f64, f64)) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (yi, xi) = poly[i];
+        let (yj, xj) = poly[j];
+        if (yi > p.0) != (yj > p.0) {
+            let t = (p.0 - yi) / (yj - yi);
+            if p.1 < xi + t * (xj - xi) {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
+/// 点到线段的最近点及其距离（米）。
+fn closest_on_seg(a: (f64, f64), b: (f64, f64), p: (f64, f64)) -> ((f64, f64), f64) {
+    let mlat = m_per_deg_lat(p.0).max(1.0);
+    let mlng = m_per_deg_lng(p.0).max(1.0);
+    let ay = a.0 * mlat;
+    let ax = a.1 * mlng;
+    let by = b.0 * mlat;
+    let bx = b.1 * mlng;
+    let py = p.0 * mlat;
+    let px = p.1 * mlng;
+    let dy = by - ay;
+    let dx = bx - ax;
+    let len2 = dy * dy + dx * dx;
+    let t = if len2 < 1e-9 {
+        0.0
+    } else {
+        (((py - ay) * dy + (px - ax) * dx) / len2).clamp(0.0, 1.0)
+    };
+    let qy = ay + t * dy;
+    let qx = ax + t * dx;
+    (((qy / mlat), (qx / mlng)), ((py - qy).powi(2) + (px - qx).powi(2)).sqrt())
+}
+
+/// 把落在多边形内的点推到边界外 `margin_m`。
+fn push_out(poly: &[(f64, f64)], p: (f64, f64), margin_m: f64) -> Option<(f64, f64)> {
+    if !point_in_poly(poly, p) {
+        return None;
+    }
+    // 找最近的一条边，从最近点沿「远离多边形」的方向推出去
+    let mut best = f64::MAX;
+    let mut nearest = p;
+    for i in 0..poly.len() {
+        let a = poly[i];
+        let b = poly[(i + 1) % poly.len()];
+        let (q, d) = closest_on_seg(a, b, p);
+        if d < best {
+            best = d;
+            nearest = q;
+        }
+    }
+    let mlat = m_per_deg_lat(p.0).max(1.0);
+    let mlng = m_per_deg_lng(p.0).max(1.0);
+    // 方向必须是「从 p 指向最近边点」再延伸出去。
+    // 原来写成 nearest + (p - nearest) * k，那是往楼里推，越推越深。
+    if best < 1e-6 {
+        // 正好压在边上：用「远离多边形质心」当外法向
+        let (cy, cx) = poly
+            .iter()
+            .fold((0.0, 0.0), |acc, q| (acc.0 + q.0, acc.1 + q.1));
+        let cy = cy / poly.len() as f64;
+        let cx = cx / poly.len() as f64;
+        let (ny, nx) = (p.0 - cy, p.1 - cx);
+        let nl = (ny * ny + nx * nx).sqrt().max(1e-12);
+        return Some((
+            p.0 + ny / nl * margin_m / mlat,
+            p.1 + nx / nl * margin_m / mlng,
+        ));
+    }
+    let dy = nearest.0 - p.0;
+    let dx = nearest.1 - p.1;
+    let k = (best + margin_m) / best;
+    Some((p.0 + dy * k, p.1 + dx * k))
+}
+
+/// 线段是否与多边形某条边严格相交（端点重合不算）。
+fn seg_crosses_poly(a: (f64, f64), b: (f64, f64), poly: &[(f64, f64)]) -> bool {
+    for i in 0..poly.len() {
+        let c = poly[i];
+        let d = poly[(i + 1) % poly.len()];
+        if seg_intersect(a, b, c, d) {
+            return true;
+        }
+    }
+    false
+}
+
+fn seg_intersect(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| -> f64 {
+        (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+    };
+    let o1 = orient(a, b, c);
+    let o2 = orient(a, b, d);
+    let o3 = orient(c, d, a);
+    let o4 = orient(c, d, b);
+    let eps = 1e-15;
+    o1 * o2 < -eps && o3 * o4 < -eps
+}
+
+/// 线段的绕行方案：a → 贴边顶点序列 → b。
+///
+/// 只处理「两端都在多边形外」的情况。把顶点按在 a→b 的哪一侧分组，
+/// 各组沿 a→b 投影排序，得到左右两条候选，取不穿墙且较短的那条。
+fn detour_around(a: (f64, f64), b: (f64, f64), poly: &[(f64, f64)], margin_m: f64) -> Option<Vec<(f64, f64)>> {
+    if poly.len() < 3 {
+        return None;
+    }
+    let mlat = m_per_deg_lat(a.0).max(1.0);
+    let mlng = m_per_deg_lng(a.0).max(1.0);
+    // 外扩：顶点沿质心方向外推 margin
+    let (cy, cx) = poly.iter().fold((0.0, 0.0), |acc, p| (acc.0 + p.0, acc.1 + p.1));
+    let cy = cy / poly.len() as f64;
+    let cx = cx / poly.len() as f64;
+    let grown: Vec<(f64, f64)> = poly
+        .iter()
+        .map(|p| {
+            let dy = (p.0 - cy) * mlat;
+            let dx = (p.1 - cx) * mlng;
+            let dl = (dy * dy + dx * dx).sqrt().max(1e-9);
+            (p.0 + dy / dl * margin_m / mlat, p.1 + dx / dl * margin_m / mlng)
+        })
+        .collect();
+
+    let diry = (b.0 - a.0) * mlat;
+    let dirx = (b.1 - a.1) * mlng;
+    let proj = |p: (f64, f64)| -> f64 { (p.0 - a.0) * mlat * diry + (p.1 - a.1) * mlng * dirx };
+    let side = |p: (f64, f64)| -> f64 { diry * (p.1 - a.1) * mlng - dirx * (p.0 - a.0) * mlat };
+
+    let mut cands: Vec<Vec<(f64, f64)>> = Vec::new();
+    for want_left in [true, false] {
+        let mut vs: Vec<(f64, f64)> = grown
+            .iter()
+            .copied()
+            .filter(|p| {
+                let sd = side(*p);
+                if want_left { sd > 0.0 } else { sd < 0.0 }
+            })
+            .collect();
+        if vs.is_empty() {
+            continue;
+        }
+        vs.sort_by(|p, q| proj(*p).partial_cmp(&proj(*q)).unwrap_or(std::cmp::Ordering::Equal));
+        let mut path = vec![a];
+        path.extend(vs);
+        path.push(b);
+        // 每一段都不能再穿墙
+        let clean = path.windows(2).all(|w| !seg_crosses_poly(w[0], w[1], &grown));
+        if clean {
+            cands.push(path);
+        }
+    }
+    cands.into_iter().min_by(|p, q| {
+        path_len(p).partial_cmp(&path_len(q)).unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+/// 整条折线避让障碍：逐点推出 + 逐段绕行。
+///
+/// 返回新点列。避不开的部分保持原样（宁可穿一次也不要整条轨迹断掉）。
+pub fn avoid_blockers(points: &[(f64, f64)], blockers: &[Vec<(f64, f64)>], margin_m: f64) -> Vec<(f64, f64)> {
+    if points.len() < 2 || blockers.is_empty() {
+        return points.to_vec();
+    }
+    // 只留下真正有面积的（Overpass 里很多 way 退化成一个点或一条线）
+    let polys: Vec<&Vec<(f64, f64)>> = blockers
+        .iter()
+        .filter(|p| p.len() >= 3 && point_span_m(p) > 4.0)
+        .collect();
+    if polys.is_empty() {
+        return points.to_vec();
+    }
+
+    // 第一步：把所有落在楼里的点推出去。
+    //
+    // 顺序很关键。先推再查段——否则「进入楼体」那一段的终点在楼里、
+    // 「离开楼体」那一段的起点在楼里，两段都会被跳过，结果一个绕行点
+    // 都不插，整条线照样穿墙（实测 400 点进去 400 点出来，什么都没变）。
+    let mut pre: Vec<(f64, f64)> = points.to_vec();
+    for p in pre.iter_mut() {
+        for poly in &polys {
+            if let Some(q) = push_out(poly, *p, margin_m) {
+                *p = q;
+            }
+        }
+    }
+
+    // 第二步：两端都在外面的段，若仍横穿楼体就插一段贴边绕行
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(pre.len());
+    out.push(pre[0]);
+    for i in 1..pre.len() {
+        let (a, b) = (pre[i - 1], pre[i]);
+        let mut cur = a;
+        let mut hits: Vec<&Vec<(f64, f64)>> = polys
+            .iter()
+            .copied()
+            .filter(|poly| !point_in_poly(poly, cur) && !point_in_poly(poly, b) && seg_crosses_poly(cur, b, poly))
+            .collect();
+        hits.sort_by(|p, q| {
+            let dp = closest_on_seg(cur, b, p[0]).1;
+            let dq = closest_on_seg(cur, b, q[0]).1;
+            dp.partial_cmp(&dq).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for poly in hits {
+            if !point_in_poly(poly, cur) && seg_crosses_poly(cur, b, poly) {
+                if let Some(path) = detour_around(cur, b, poly, margin_m) {
+                    for p in path.into_iter().skip(1) {
+                        if p != b {
+                            out.push(p);
+                        }
+                    }
+                    cur = *out.last().unwrap();
+                }
+            }
+        }
+        out.push(b);
+    }
+
+    // 第三步：绕行点可能又贴到别的楼，再推一次
+    for p in out.iter_mut() {
+        for poly in &polys {
+            if let Some(q) = push_out(poly, *p, margin_m) {
+                *p = q;
+            }
+        }
+    }
+    out
+}
+
 /// 蛇形扫描填充多边形，返回折线点。
 ///
 /// `spacing_m` 是相邻扫描线的间距（米）。越小线越密、总长越长。
@@ -732,7 +981,10 @@ pub fn route_through_in_order(
     let mut guard = 0;
     // 总长一旦超过目标的 3 倍就停，防止补里程循环失控
     let hard_cap = want_m * 3.0 + 1000.0;
-    while total < want_m && guard < 200 && total < hard_cap {
+    // 补到「目标 - 容差」就收工。硬凑整会把最后几百米变成几个原地小圈，
+    // 既不自然又容易穿楼；服务端只看点位顺序和最低里程，差 300 m 照收。
+    let stop_at = (want_m - super::geo::length_tolerance(want_m)).max(want_m * 0.7);
+    while total < stop_at && guard < 200 && total < hard_cap {
         guard += 1;
         let anchor = *points.last().unwrap();
         // 绕圈半径 40~90m，圈心朝围栏中心
@@ -1170,4 +1422,116 @@ mod order_debug_tests {
             assert!(d < 3000.0, "点 ({:.5},{:.5}) 距围栏 {d:.0}m", p.0, p.1);
         }
     }
+
+    /// 一个 33m × 33m 的矩形，当作一栋楼（纬度 0 附近，1° ≈ 110574m）。
+    fn building() -> Vec<(f64, f64)> {
+        vec![
+            (0.0, 0.0),
+            (0.0, 0.0003),
+            (0.0003, 0.0003),
+            (0.0003, 0.0),
+        ]
+    }
+
+    #[test]
+    fn point_in_poly_works() {
+        let b = building();
+        assert!(point_in_poly(&b, (0.00015, 0.00015)), "中心点应在楼内");
+        assert!(!point_in_poly(&b, (0.0009, 0.00015)), "楼外点不该判成在内");
+        assert!(!point_in_poly(&b, (-0.0001, 0.0)), "边界外不该判成在内");
+    }
+
+    #[test]
+    fn segment_through_building_is_detected() {
+        let b = building();
+        // 从左往右横穿
+        assert!(seg_crosses_poly((0.00015, -0.0005), (0.00015, 0.0008), &b));
+        // 完全在楼外
+        assert!(!seg_crosses_poly((0.0009, -0.0005), (0.0009, 0.0008), &b));
+    }
+
+    #[test]
+    fn avoid_blockers_detours_around_building() {
+        let b = building();
+        let line = vec![(0.00015, -0.0005), (0.00015, 0.0008)];
+        let out = avoid_blockers(&line, std::slice::from_ref(&b), 3.0);
+        assert!(out.len() > 2, "横穿楼体应插入绕行点，实际只有 {} 点", out.len());
+        // 绕行之后任何一段都不能再穿墙
+        for w in out.windows(2) {
+            assert!(
+                !seg_crosses_poly(w[0], w[1], &b),
+                "绕行后仍在穿楼: ({:.6},{:.6}) → ({:.6},{:.6})",
+                w[0].0, w[0].1, w[1].0, w[1].1
+            );
+        }
+        // 也不该把点留在楼里
+        for p in &out {
+            assert!(!point_in_poly(&b, *p), "点 ({:.6},{:.6}) 仍在楼里", p.0, p.1);
+        }
+        // 起点终点不能被挪走
+        assert_eq!(out.first().unwrap(), line.first().unwrap());
+        assert_eq!(out.last().unwrap(), line.last().unwrap());
+    }
+
+    #[test]
+    fn avoid_blockers_pushes_out_interior_points() {
+        let b = building();
+        let inside = vec![(0.00012, 0.00012), (0.00018, 0.00018)];
+        assert!(point_in_poly(&b, inside[0]));
+        let out = avoid_blockers(&inside, std::slice::from_ref(&b), 3.0);
+        for p in &out {
+            assert!(!point_in_poly(&b, *p), "点 ({:.6},{:.6}) 没被推出去", p.0, p.1);
+        }
+        // 推出去的距离不应夸张
+        for p in &out {
+            let d = distance(*p, (0.00015, 0.00015));
+            assert!(d < 200.0, "推得太远 {d:.0}m，可能坐标算错了");
+        }
+    }
+
+    #[test]
+    fn avoid_blockers_is_noop_without_blockers() {
+        let line = vec![(0.0, 0.0), (0.001, 0.001)];
+        let out = avoid_blockers(&line, &[], 3.0);
+        assert_eq!(out, line, "没有障碍时应原样返回");
+    }
+
+    #[test]
+    fn tiny_degenerate_polys_are_ignored() {
+        // Overpass 里很多 way 退化成一个点或一条线，不该参与避让
+        let degenerate = vec![vec![(0.0, 0.0), (0.0, 0.000001), (0.0, 0.000002)]];
+        let line = vec![(0.0, 0.0), (0.001, 0.001)];
+        let out = avoid_blockers(&line, &degenerate, 3.0);
+        assert_eq!(out, line, "退化多边形应被跳过");
+    }
+
+
+    #[test]
+    fn detour_debug_real_coords() {
+        // 齐齐哈尔校区真实纬度上，一个 30m × 30m 的矩形
+        let lat = 47.38255;
+        let lng = 123.96670;
+        let dy = 15.0 / 111_000.0;
+        let dx = 15.0 / (111_000.0 * 0.677); // cos(47.38°) ≈ 0.677
+        let poly = vec![
+            (lat - dy, lng - dx),
+            (lat - dy, lng + dx),
+            (lat + dy, lng + dx),
+            (lat + dy, lng - dx),
+        ];
+        // 东西向横穿
+        let a = (lat, lng - dx * 3.0);
+        let b = (lat, lng + dx * 3.0);
+        assert!(seg_crosses_poly(a, b, &poly), "应判定为穿过");
+        let r = detour_around(a, b, &poly, 3.0);
+        println!("detour 结果 = {:?}", r);
+        let out = avoid_blockers(&[a, b], std::slice::from_ref(&poly), 3.0);
+        println!("avoid_blockers 输出 {} 点: {:?}", out.len(), out);
+        let inside = out.iter().filter(|p| point_in_poly(&poly, **p)).count();
+        println!("落在矩形内的点 = {inside}");
+        assert!(r.is_some(), "detour_around 返回 None，绕行没生成");
+        assert!(out.len() > 2, "avoid_blockers 没插点");
+        assert_eq!(inside, 0, "仍有 {inside} 个点落在矩形内");
+    }
+
 }

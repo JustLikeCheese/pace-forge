@@ -299,6 +299,167 @@ pub fn fetch_water(bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<(f64, f64)>>, S
     Ok(polys)
 }
 
+
+/// 本地手绘禁区（Web 地图上圈出来的楼、施工区、封路）。
+///
+/// OSM 在国内校园几乎空白，Overpass 拉不到建筑轮廓，只能人工标一次。
+/// 存一个文件，所有账号、所有之后的规划都用它。
+pub fn load_local_blockers() -> Vec<Vec<(f64, f64)>> {
+    let path = blockers_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("polys").and_then(|p| p.as_array()) {
+        for poly in arr {
+            let Some(pts) = poly.as_array() else { continue };
+            let pts: Vec<(f64, f64)> = pts
+                .iter()
+                .filter_map(|p| {
+                    let a = p.as_array()?;
+                    Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?))
+                })
+                .collect();
+            if pts.len() >= 3 {
+                out.push(pts);
+            }
+        }
+    }
+    out
+}
+
+/// 保存本地禁区。
+pub fn save_local_blockers(polys: &[Vec<(f64, f64)>]) -> Result<(), String> {
+    let path = blockers_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("建目录失败: {e}"))?;
+    }
+    let body = serde_json::json!({
+        "polys": polys
+            .iter()
+            .map(|p| p.iter().map(|q| vec![q.0, q.1]).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    });
+    std::fs::write(&path, body.to_string()).map_err(|e| format!("写文件失败: {e}"))
+}
+
+fn blockers_path() -> std::path::PathBuf {
+    let dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    std::path::PathBuf::from(dir).join(".pace-forge").join("blockers.json")
+}
+
+/// 拉围栏内的建筑物轮廓。
+///
+/// 路网数据不足时的兜底是「把打卡点按顺序用弧线串起来」——纯几何，不看楼。
+/// 实测校区里 5 个打卡点分属不同楼群，串出来的弧直接从教学楼、宿舍楼中间
+/// 穿过去，地图上一眼就假。拿到轮廓后由 fence_route::avoid_blockers 做避让。
+pub fn fetch_buildings(bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<(f64, f64)>>, String> {
+    if let Some(b) = poly_cache_get(bbox, "buildings") {
+        return Ok(b);
+    }
+    let (min_lat, min_lon, max_lat, max_lon) = bbox;
+    let query = format!(
+        "[out:json][timeout:30];(way[\"building\"]({min_lat},{min_lon},{max_lat},{max_lon}););out geom;"
+    );
+    let polys = fetch_polys(&query, "建筑")?;
+    poly_cache_put(bbox, "buildings", &polys);
+    Ok(polys)
+}
+
+/// Overpass 拉 polygon 的公共部分（水体、建筑共用）。
+fn fetch_polys(query: &str, what: &str) -> Result<Vec<Vec<(f64, f64)>>, String> {
+    let body = format!("data={}", urlencode(query));
+    let mut text = String::new();
+    let mut last_err = String::new();
+    for host in OVERPASS_HOSTS {
+        match ureq::post(host)
+            .set("User-Agent", "pace-forge/0.1 (route planning)")
+            .set("Content-Type", "application/x-www-form-urlencoded")
+            .timeout(std::time::Duration::from_secs(60))
+            .send_string(&body)
+        {
+            Ok(r) => match r.into_string() {
+                Ok(t) if t.contains("\"elements\"") => {
+                    text = t;
+                    break;
+                }
+                Ok(_) => last_err = format!("{host} 内容异常"),
+                Err(e) => last_err = format!("{host} 读取失败: {e}"),
+            },
+            Err(e) => last_err = format!("{host} 请求失败: {e}"),
+        }
+    }
+    if text.is_empty() {
+        return Err(format!("拉{what}失败: {last_err}"));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("{what} JSON 解析失败: {e}"))?;
+    let mut polys = Vec::new();
+    if let Some(els) = v.get("elements").and_then(|e| e.as_array()) {
+        for el in els {
+            let Some(geom) = el.get("geometry").and_then(|g| g.as_array()) else {
+                continue;
+            };
+            let pts: Vec<(f64, f64)> = geom
+                .iter()
+                .filter_map(|p| Some((p.get("lat")?.as_f64()?, p.get("lon")?.as_f64()?)))
+                .collect();
+            if pts.len() >= 3 {
+                polys.push(pts);
+            }
+        }
+    }
+    Ok(polys)
+}
+
+fn poly_cache_path(bbox: (f64, f64, f64, f64), kind: &str) -> std::path::PathBuf {
+    let key = format!("{:.3}_{:.3}_{:.3}_{:.3}", bbox.0, bbox.1, bbox.2, bbox.3);
+    let dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    std::path::PathBuf::from(dir)
+        .join(".pace-forge")
+        .join(format!("{kind}-{key}.json"))
+}
+
+fn poly_cache_get(bbox: (f64, f64, f64, f64), kind: &str) -> Option<Vec<Vec<(f64, f64)>>> {
+    let path = poly_cache_path(bbox, kind);
+    let meta = std::fs::metadata(&path).ok()?;
+    if let Ok(age) = meta.modified().and_then(|t| t.elapsed().map_err(std::io::Error::other)) {
+        if age.as_secs() > 30 * 86400 {
+            return None;
+        }
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let mut out = Vec::new();
+    for poly in v.get("polys")?.as_array()? {
+        let pts: Vec<(f64, f64)> = poly
+            .as_array()?
+            .iter()
+            .filter_map(|p| {
+                let a = p.as_array()?;
+                Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?))
+            })
+            .collect();
+        if pts.len() >= 3 {
+            out.push(pts);
+        }
+    }
+    Some(out)
+}
+
+fn poly_cache_put(bbox: (f64, f64, f64, f64), kind: &str, polys: &[Vec<(f64, f64)>]) {
+    let path = poly_cache_path(bbox, kind);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body = serde_json::json!({
+        "polys": polys.iter().map(|p| p.iter().map(|q| vec![q.0, q.1]).collect::<Vec<_>>()).collect::<Vec<_>>()
+    });
+    let _ = std::fs::write(&path, body.to_string());
+}
+
 fn water_cache_path(bbox: (f64, f64, f64, f64)) -> std::path::PathBuf {
     let key = format!("{:.3}_{:.3}_{:.3}_{:.3}", bbox.0, bbox.1, bbox.2, bbox.3);
     let dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());

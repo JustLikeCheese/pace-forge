@@ -559,6 +559,36 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         // 优先走真实道路。OSM 在部分校区完全没有数据（实测某校整个 bbox
         // 只有 1 个 landuse 标签），所以这是「能走就走」，失败静默降级到
         // 几何规划——不能因为查不到路网就不跑了。
+        // 障碍轮廓：建筑 + 水体。路线生成完后再避让，不能让轨迹从楼里穿过。
+        // 数据源是 Overpass（30 天缓存），拉不到就跳过，不阻断跑单。
+        let blockers: Vec<Vec<(f64, f64)>> = {
+            let bbox = crate::track::roadnet::bbox_of(&fence_ring, 60.0);
+            let mut v: Vec<Vec<(f64, f64)>> = Vec::new();
+            match crate::track::roadnet::fetch_buildings(bbox) {
+                Ok(b) if !b.is_empty() => {
+                    log(&format!("[block] 建筑轮廓 {} 栋", b.len()));
+                    v.extend(b);
+                }
+                Ok(_) => log("[block] 这一带没有建筑数据"),
+                Err(e) => log(&format!("[block] 建筑轮廓没拿到（{e}），本次不避让")),
+            }
+            if let Ok(w) = crate::track::roadnet::fetch_water(bbox) {
+                if !w.is_empty() {
+                    log(&format!("[block] 水域 {} 片", w.len()));
+                    v.extend(w);
+                }
+            }
+            // 本地手绘禁区。OSM 在国内校园基本是空白（实测某校区整个 bbox
+            // 只有 15 个 way、76 个 node，一栋楼都没有），Overpass 拿不到轮廓
+            // 时只能靠人自己在地图上圈。这份标注全账号共享，长期有效。
+            let local = crate::track::roadnet::load_local_blockers();
+            if !local.is_empty() {
+                log(&format!("[block] 本地标注禁区 {} 块", local.len()));
+                v.extend(local);
+            }
+            v
+        };
+
         let on_roads = if p.prefer_roads {
             try_route_on_roads(&fence_ring, &must, p.distance_m, seed, &mut *log)
         } else {
@@ -602,6 +632,19 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             120.0,
             if p.seed != 0 { p.seed } else { start_ms as u64 },
         );
+        // 建筑避让放在摆动之后：add_wander 会把点横推 ±6m，先避让再摆动
+        // 等于白做。这里逐点推出楼体 + 逐段插贴边绕行，外扩 3m 当作墙根。
+        let wandered = if blockers.is_empty() {
+            wandered
+        } else {
+            let before = wandered.len();
+            let avoided = crate::track::fence_route::avoid_blockers(&wandered, &blockers, 3.0);
+            let pushed = avoided.len().saturating_sub(before);
+            if pushed > 0 {
+                log(&format!("[block] 绕开建筑/水面，多插 {pushed} 个点"));
+            }
+            avoided
+        };
         let sampled = crate::track::fence_route::resample_with_checkpoints(
             &wandered,
             p.sample_step_m,
@@ -767,7 +810,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         total_ascent: 0,
     };
     let probe_sub = super::submit::build(&probe, &track_points, &[], &sim)?;
-    let view = super::submit::verify_view(&probe_sub.save_record)?;
+    let view = super::submit::verify_view(&probe_sub.save_record, &probe_sub.points)?;
     log(&format!(
         "√ [verify] 从报文反解：{} 点 / {:.0}m / {}s / {} 步 / {} 个步数桶",
         view.point_count,
@@ -1061,7 +1104,7 @@ pub fn run_full(
     // 派生字段互校：爬升 / 卡路里 / 功率 / 配速 / 圈数据必须与点位列自洽。
     // 这些都是「填错了也能提交成功」的字段，回退成常量只会让服务端把整条
     // 记录判成来源可疑，所以宁可在这里拦下。
-    let derived_problems = super::submit::audit_derived(&body);
+    let derived_problems = super::submit::audit_derived(&body, &submission.points);
     if !derived_problems.is_empty() {
         return Err(format!(
             "报文派生字段自检失败（未提交）：{}",
@@ -1088,13 +1131,15 @@ pub fn run_full(
     log(&format!("[obs] 用 rrid={rrid} 上传明细…"));
     // OBS 的 fixed_point_json 要的是裸点位数组，不是主报文那层 envelope。
     // 之前把 envelope 整个塞进来，服务端解不出点位列表。
+    // OBS 的 fixed_point_json 要的是**完整 envelope**（含 fivePointJson 内层串、
+    // useZip、runAreaId、geoFencesJson、freedomShowFence），不是裸点位数组。
+    // 参照实现 Neko 的 build_obs_object 就是这么发的；传裸数组时服务端解析
+    // 不出点位，于是「按顺序通过所有点位」永远 false。
     let five_pt = body
         .get("fivePointJson")
         .and_then(|v| v.as_str())
-        .and_then(|t| serde_json::from_str::<Value>(t).ok())
-        .and_then(|v| v.get("fivePointJson").cloned())
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_string();
     let payload = detail_payload_rrid(&out.track, &out.sim, p, &uid, rrid, start_ms, &uuid, &five_pt);
     // 本地时区和 UTC 各传一份：服务端拼 key 用哪个时区没有确定证据，
     // 猜错就等于轨迹对象不存在，记录点开只有标量数据。
@@ -1224,6 +1269,13 @@ pub fn detail_payload_rrid(
         // 对「哪个点是打卡点」的判断一致
         let cp_idxs: Vec<usize> = serde_json::from_str::<Value>(five_point_json)
             .ok()
+            // 传进来的是 envelope 时取内层 fivePointJson，是裸数组时直接用
+            .and_then(|v| {
+                v.get("fivePointJson")
+                    .and_then(|x| x.as_str())
+                    .and_then(|t| serde_json::from_str::<Value>(t).ok())
+                    .or(Some(v))
+            })
             .and_then(|v| v.as_array().cloned())
             .map(|arr| {
                 arr.iter()

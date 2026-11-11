@@ -127,7 +127,11 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
     let times = assign_times(n, req.start_ms, req.total_sec);
 
     // 5. 里程对齐（锁首点）
-    let (_len, _) = scale_to_length(&mut flat, req.total_distance_m, &[0], 0.1);
+    // 容差放到 15%（最多 300m）：几何本身已经落在可接受区间就不缩放，
+    // 保持串点位后的自然形状。硬缩放到精确 2.000 km 会把整条线拉伸，
+    // 反而容易把点拉进建筑物里。
+    let tol = super::geo::length_tolerance(req.total_distance_m);
+    let (_len, _) = scale_to_length(&mut flat, req.total_distance_m, &[0], tol);
 
     // 6. 打卡点吸附 + 再次对齐 + 归位
     let mut anchor_idx = Vec::new();
@@ -156,6 +160,33 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
             flat[idx] = (cp.lat, cp.lng);
         }
     }
+
+    // 建筑/禁区避让。OSM 在国内校园基本没有建筑轮廓，Web 上可以人工圈，
+    // 存成 blockers.json；这里对所有走 planner 的路径（Web 预览、CLI、兜底）
+    // 统一生效，跟 flow::build 里那条路保持一致。
+    let blockers = crate::track::roadnet::load_local_blockers();
+    let (flat, times) = if blockers.is_empty() || flat.len() < 3 {
+        (flat, times)
+    } else {
+        let before_len = crate::track::geo::path_length(&flat);
+        let avoided = crate::track::fence_route::avoid_blockers(&flat, &blockers, 3.0);
+        // 注意：避让可能只挪点、不插点，长度不变。用坐标比较，不能用长度
+        // 判断（用长度会把「推出楼体」的结果整个丢掉，线照样穿墙）。
+        if avoided == flat {
+            (flat, times)
+        } else {
+            // 绕行会插点，时间戳按比例摊回去，保证总时长不变
+            let after_len = crate::track::geo::path_length(&avoided);
+            let n = avoided.len();
+            let span = times.last().copied().unwrap_or(0) - times.first().copied().unwrap_or(0);
+            let t0 = times.first().copied().unwrap_or(0);
+            let times: Vec<i64> = (0..n)
+                .map(|i| t0 + span * i as i64 / (n.max(2) - 1) as i64)
+                .collect();
+            let _ = (before_len, after_len);
+            (avoided, times)
+        }
+    };
 
     let points: Vec<TrackPoint> = flat
         .iter()
@@ -302,12 +333,15 @@ mod tests {
     }
 
     #[test]
-    fn length_matches_target() {
+    fn length_within_tolerance() {
+        // 不再要求精确 2000.0：几何本身落在容差内就不缩放（见 geo::length_tolerance）。
+        // 硬凑整会把轨迹拧成不自然的形状，还可能把点拉进楼里。
         let mut r = rng();
         let res = plan(&base_req(), &mut r).unwrap();
+        let tol = super::super::geo::length_tolerance(2000.0);
         assert!(
-            (res.actual_length_m - 2000.0).abs() < 1.0,
-            "实测长度 {} 与目标 2000 差太多",
+            (res.actual_length_m - 2000.0).abs() <= tol,
+            "实测长度 {} 超出目标 2000 的容差 {tol}m",
             res.actual_length_m
         );
     }
