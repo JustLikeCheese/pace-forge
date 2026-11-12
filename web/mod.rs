@@ -680,7 +680,7 @@ fn handle_plan(
             total_sec,
             start_ms,
             sport_type,
-            sample_step_m: 5.0,
+            sample_step_m: 10.0, // 匹配真机 ~10m 采样（2km≈200 点）
         };
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(start_ms as u64);
@@ -1106,13 +1106,41 @@ fn handle_login_all(request: tiny_http::Request, state: Shared) -> Result<(), St
 }
 
 /// 批量刷：所有就绪账号依次跑一遍。
+/// 按种子随机一组自洽的 (距离 km, 时长 min)。
+///
+/// 区间来自 5 个账号共 ~50 条真机记分跑记录：距离绝大多数 2.0~2.1km（2.0 是
+/// 规则下限），按用户口径放宽到 2.0~2.4；配速 p10~p90 = 5.4~7.9、中位 6.4 分/km，
+/// 这里取 5.6~7.8。时长 = 距离 × 配速，于是步数（由配速推导）也随之变化。
+/// 三者保持 `v = 步频/60 × 步幅` 自洽——不是各自独立乱填。
+fn rand_run_spec(seed: u64) -> (f64, f64) {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let dist = (rng.gen_range(2.00_f64..=2.40) * 100.0).round() / 100.0;
+    let pace = rng.gen_range(5.6_f64..=7.8); // 分/km，5 账号实测 p10~p90
+    let dur = (dist * pace * 10.0).round() / 10.0; // 分钟，保留 0.1
+    (dist, dur)
+}
+
+/// 每个账号一个稳定但互不相同的随机种子（账号 id 混入时刻，每次批量都变）。
+fn account_seed(id: &str, salt: u64) -> u64 {
+    let mut h = 0xcbf29ce484222325u64 ^ salt;
+    for b in id.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 fn handle_batch(
     request: tiny_http::Request,
     state: Shared,
     body: &Value,
 ) -> Result<(), String> {
-    let distance_km = body["distance"].as_f64().unwrap_or(2.0);
-    let duration_min = body["duration"].as_f64().unwrap_or(12.0);
+    let distance_km = body["distance"].as_f64().unwrap_or(0.0);
+    let duration_min = body["duration"].as_f64().unwrap_or(0.0);
+    // random=true，或没给距离/时长，则每个账号各自随机，彼此不同——避免所有
+    // 账号同 IP 同时提交一模一样的 2.0km/12min 这种一眼假的指纹。
+    let random = body["random"].as_bool().unwrap_or(distance_km <= 0.0 || duration_min <= 0.0);
     let run_mode = body["runMode"].as_i64().unwrap_or(1);
     let start_at_ms = body["startAtMs"].as_i64().filter(|v| *v > 0);
     let sport_type = body["sportType"].as_i64().unwrap_or(1) as i32;
@@ -1124,12 +1152,13 @@ fn handle_batch(
         .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
 
-    if distance_km <= 0.0 || distance_km > 42.0 {
+    if !random && (distance_km <= 0.0 || distance_km > 42.0) {
         return json_err(request, "距离需在 0~42 公里之间");
     }
-    if duration_min <= 0.0 || duration_min > 120.0 {
+    if !random && (duration_min <= 0.0 || duration_min > 120.0) {
         return json_err(request, "时长需在 0~120 分钟之间（超过服务端必然驳回）");
     }
+    let batch_salt = crate::crypto::envelope::now_ms() as u64;
 
     // 挑出要跑的账号
     let targets: Vec<String> = {
@@ -1177,12 +1206,21 @@ fn handle_batch(
             continue;
         }
 
+        // 每账号各自随机：距离/时长/种子都不同，于是轨迹、步数、配速都不同。
+        let seed = account_seed(id, batch_salt);
+        let (dist_km, dur_min) = if random {
+            rand_run_spec(seed)
+        } else {
+            (distance_km, duration_min)
+        };
+
         let p = crate::api::flow::RunParams {
-            distance_m: distance_km * 1000.0,
-            duration_sec: (duration_min * 60.0).round() as i64,
+            distance_m: dist_km * 1000.0,
+            duration_sec: (dur_min * 60.0).round() as i64,
             sport_type,
             run_mode,
             start_at_ms,
+            seed,
             ..Default::default()
         };
 
@@ -1212,6 +1250,8 @@ fn handle_batch(
                     "ok": true,
                     "submitted": o.submitted,
                     "recordId": o.record_id,
+                    "targetKm": (dist_km * 100.0).round() / 100.0,
+                    "targetMin": (dur_min * 10.0).round() / 10.0,
                     "distance": o.real_length_m,
                     "steps": o.total_steps,
                     "logs": logs.borrow().clone(),
