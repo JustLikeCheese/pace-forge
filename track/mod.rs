@@ -19,6 +19,9 @@ pub use buckets::{make_jitter, speed_buckets, step_buckets, SpeedBucket, StepBuc
 pub use kinematics::{arc_and_curvature, pace_profile, speed_limit_ahead, turn_speed_limit, KinParams};
 pub use preflight::{inspect, Check, Issue, Level, Report};
 pub use simulate::{retime, simulate, validate, SimParams, SimResult};
-pub use stadium::{lap_length, lane_radius, looks_like_stadium, stadium_track, StadiumSpec};
+pub use stadium::{
+    campus_oval_track, lap_length, lane_radius, looks_like_stadium, random_oval, stadium_track,
+    OvalSpec, StadiumSpec,
+};
 pub use geo::{distance, path_length, sample_along, scale_to_length};
 pub use planner::{assign_times, plan, Checkpoint, PlanRequest, PlanResult, TrackPoint};

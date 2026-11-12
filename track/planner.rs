@@ -57,7 +57,7 @@ impl Default for PlanRequest {
             total_sec: 720,
             start_ms: 0,
             sport_type: 1,
-            sample_step_m: 5.0,
+            sample_step_m: 10.0,
         }
     }
 }

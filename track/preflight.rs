@@ -224,16 +224,22 @@ pub fn inspect(c: &Check) -> Report {
     }
 
     // ── 四、打卡点 ──
+    //
+    // 阈值 20m，不是 0.5m。实测 6 条真机有效记录到各打卡点的最近距离是
+    // 1.1~15.9m，没有一个 ≤0.5m——服务端按"采样点落在点位邻域"判经过，不是
+    // 精确命中。0.5m 是早先的错误假设，它逼着轨迹精确穿过每个点位，操场绕圈
+    // 里场心那种点位就得硬拽出尖刺。放宽到 20m 后，真实形状的椭圆自然满足。
+    const CP_TOL_M: f64 = 20.0;
     for (lat, lng, name) in c.checkpoints {
         let best = c
             .points
             .iter()
             .map(|p| distance((p.lat, p.lon), (*lat, *lng)))
             .fold(f64::INFINITY, f64::min);
-        if best > 0.5 {
+        if best > CP_TOL_M {
             issues.push(Issue::fatal(
                 "CP_MISS",
-                format!("打卡点 {name} 最近距离 {best:.1}m，未命中（要求 ≤0.5m）"),
+                format!("打卡点 {name} 最近距离 {best:.1}m，未命中（要求 ≤{CP_TOL_M:.0}m）"),
             ));
         }
     }

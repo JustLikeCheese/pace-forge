@@ -191,6 +191,14 @@ button.danger:disabled{opacity:.5}
         <option>1</option><option>2</option><option>3</option><option>4</option>
         <option>5</option><option>6</option><option>7</option><option>8</option>
       </select></label>
+      <label title="勾选后每次提交在下面区间里随机取距离；批量时每个账号各取一个，彼此不同">
+        <input id="rAutoDist" type="checkbox" checked> 距离自动
+        <span style="display:inline-flex;gap:4px;align-items:center;margin-left:4px">
+          <input id="rDistMin" type="number" value="2.0" step="0.1" min="0.5" max="21" style="width:58px">
+          ~
+          <input id="rDistMax" type="number" value="2.4" step="0.1" min="0.5" max="21" style="width:58px">
+        </span>
+      </label>
       <label>距离 km<input id="rDist" type="number" value="2.0" step="0.1" min="0.5" max="21"></label>
       <label>配速 分/km
         <span style="display:inline-flex;gap:4px;align-items:center">
@@ -360,6 +368,23 @@ function fmtPaceMin(v) {
   return m + "'" + String(sec).padStart(2, '0') + '"';
 }
 
+function distRange() {
+  const a = parseFloat($('rDistMin').value);
+  const b = parseFloat($('rDistMax').value);
+  const lo = Number.isFinite(a) && a >= 0.5 ? a : 2.0;
+  const hi = Number.isFinite(b) && b >= 0.5 ? b : 2.4;
+  return [Math.min(lo, hi), Math.max(lo, hi)];
+}
+
+/// 取本次要用的距离（km）。勾了自动就现随机一个并回填输入框（10m 粒度）。
+function readDist() {
+  if (!$('rAutoDist').checked) return parseFloat($('rDist').value) || 0;
+  const [lo, hi] = distRange();
+  const d = Math.round((lo + Math.random() * (hi - lo)) * 100) / 100;
+  $('rDist').value = d.toFixed(2);
+  return d;
+}
+
 /// 取本次要用的时长（分钟）。勾了自动就现随机一个并回填输入框。
 function readDur(dist) {
   if (!$('rAutoDur').checked) return parseFloat($('rDur').value) || 0;
@@ -380,16 +405,25 @@ function syncDurHint() {
   }
 }
 
+function syncDist() {
+  $('rDist').readOnly = $('rAutoDist').checked;
+  syncDurHint();
+}
+
 ['rAutoDur', 'rPaceMin', 'rPaceMax', 'rDist'].forEach(id => {
   const el = $(id);
   if (el) { el.oninput = syncDurHint; el.onchange = syncDurHint; }
 });
-syncDurHint();
+['rAutoDist', 'rDistMin', 'rDistMax'].forEach(id => {
+  const el = $(id);
+  if (el) { el.oninput = syncDist; el.onchange = syncDist; }
+});
+syncDist();
 
 $('planBtn').onclick = async () => {
   let st = null;
   try { st = await resolveStartAt(); } catch (e) { if (e.message !== '已取消') setOut(e.message, true); return; }
-  const dist = parseFloat($('rDist').value);
+  const dist = readDist();
   const dur = readDur(dist);
   const stepsRaw = $('rSteps').value.trim();
   const steps = stepsRaw === '' ? null : parseInt(stepsRaw, 10);
@@ -505,7 +539,7 @@ $('semBtn').onclick = async () => {
 
 /* ---------- 真跑 ---------- */
 $('runBtn').onclick = async () => {
-  const dist = parseFloat($('rDist').value);
+  const dist = readDist();
   const dur = readDur(dist);
   if (!(dist > 0) || !(dur > 0)) return setOut('距离和时长要填正数', true);
   const mode = parseInt($('rRunMode').value, 10) || 1;
@@ -777,15 +811,21 @@ $('accLoginAll').onclick = async () => {
 };
 
 $('accBatch').onclick = async () => {
-  const dist = parseFloat($('rDist').value);
-  const dur = readDur(dist);
   const mode = parseInt($('rRunMode').value, 10) || 1;
   const modeName = {1: '记分跑', 2: '户外跑', 3: '室外锻炼'}[mode];
-  if (!(dist > 0) || !(dur > 0)) { $('accMsg').textContent = '先在上面的表单填好距离和时长'; return; }
+  // 距离自动 = 每个账号各自随机（后端按账号种子取不同的距离/时长/轨迹）。
+  const perRandom = $('rAutoDist').checked;
+  const fixedDist = perRandom ? 0 : parseFloat($('rDist').value);
+  const fixedDur = perRandom ? 0 : readDur(fixedDist);
+  if (!perRandom && !(fixedDist > 0 && fixedDur > 0)) { $('accMsg').textContent = '关掉"距离自动"时要填好距离和时长'; return; }
   let st = null;
   try { st = await resolveStartAt(); } catch (e) { if (e.message !== '已取消') return; }
   const when = st ? `${st.startText} ~ ${st.stopText}` : '现在开始';
-  if (!confirm(`所有已登录账号都跑 ${dist} km / ${dur} 分钟（${modeName}）？\n时间：${when}\n\n账号之间间隔 8 秒，避免同 IP 高频。`)) return;
+  const [dlo, dhi] = distRange();
+  const desc = perRandom
+    ? `每个账号各自随机：距离 ${dlo}~${dhi}km、配速区间内随机时长（${modeName}）`
+    : `所有账号都跑 ${fixedDist} km / ${fixedDur} 分钟（${modeName}）`;
+  if (!confirm(`${desc}？\n时间：${when}\n\n账号之间间隔 8 秒，避免同 IP 高频。`)) return;
 
   const m = $('accMsg');
   const btn = $('accBatch');
@@ -797,14 +837,16 @@ $('accBatch').onclick = async () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        distance: dist, duration: dur, runMode: mode,
+        random: perRandom,
+        distance: fixedDist, duration: fixedDur, runMode: mode,
         sportType: 1, gapMs: 8000,
         startAtMs: (st ? st.startMs : undefined)
       })
     });
     const lines = (r.results || []).map(x => {
-      if (x.ok && x.submitted) return `✓ ${x.id} → 记录 #${x.recordId}`;
-      if (x.ok) return `· ${x.id} 未提交`;
+      const tgt = (x.targetKm != null) ? ` [${x.targetKm}km/${x.targetMin}min]` : '';
+      if (x.ok && x.submitted) return `✓ ${x.id}${tgt} → 记录 #${x.recordId}`;
+      if (x.ok) return `· ${x.id}${tgt} 未提交`;
       return `✗ ${x.id} → ${x.error}`;
     });
     m.innerHTML = `<b>完成：${r.submitted}/${r.total} 个已提交</b><pre class="mono" style="font-size:11px;white-space:pre-wrap;max-height:240px;overflow:auto;margin-top:6px">${lines.join('\n')}</pre>`;

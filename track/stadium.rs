@@ -122,6 +122,117 @@ pub fn point_at(s: f64, radius: f64, heading: f64) -> (f64, f64) {
     (x * cs - y * sn, x * sn + y * cs)
 }
 
+/// 任意尺寸跑道中心线取点（直道长与半径都可变）。
+/// 真实校园操场常见 ~280m（直道 ~55m、半径 ~26m），不是国际标准 400m。
+pub fn point_at_dim(s: f64, straight: f64, radius: f64, heading: f64) -> (f64, f64) {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    let half = straight / 2.0;
+    let curve = PI * radius;
+    let lap = 2.0 * straight + 2.0 * curve;
+    let t = s.rem_euclid(lap);
+    let (x, y) = if t < straight {
+        (-half + t, -radius)
+    } else if t < straight + curve {
+        let a = -FRAC_PI_2 + (t - straight) / radius;
+        (half + radius * a.cos(), radius * a.sin())
+    } else if t < 2.0 * straight + curve {
+        (half - (t - straight - curve), radius)
+    } else {
+        let a = FRAC_PI_2 + (t - 2.0 * straight - curve) / radius;
+        (-half + radius * a.cos(), radius * a.sin())
+    };
+    let (sn, cs) = heading.sin_cos();
+    (x * cs - y * sn, x * sn + y * cs)
+}
+
+/// 一条校园操场的随机规格：尺寸/朝向/道次/圈数按真实记录区间随机。
+#[derive(Debug, Clone, Copy)]
+pub struct OvalSpec {
+    pub straight: f64,
+    pub radius: f64,
+    pub heading: f64,
+    pub laps: f64,
+}
+
+/// 按目标里程和随机种子挑一条操场规格。
+///
+/// 真机实测两条跑道：主用 ~280m（直道 52~71m、半径 24~27m，朝向 ~90°，跑 7 圈），
+/// 偶用 ~400m（直道 ~123m、半径 ~32m，4.5 圈）。这里按 ~85% 概率取小操场、
+/// 15% 取大操场，尺寸/朝向在实测区间内抖动。
+pub fn random_oval(distance_m: f64, seed: u64) -> OvalSpec {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let big = rng.gen_bool(0.15);
+    let (straight, radius) = if big {
+        (rng.gen_range(115.0..130.0), rng.gen_range(30.0..34.0))
+    } else {
+        (rng.gen_range(50.0..70.0), rng.gen_range(24.0..28.0))
+    };
+    // 朝向：主轴 ~90°（东西向），±8° 抖动
+    let heading = (90.0_f64 + rng.gen_range(-8.0_f64..8.0)).to_radians();
+    let lap = 2.0 * straight + 2.0 * std::f64::consts::PI * radius;
+    let laps = (distance_m / lap).max(1.0);
+    OvalSpec { straight, radius, heading, laps }
+}
+
+/// 校园操场多圈轨迹：可变尺寸 + 入场尾巴 + 每圈 GPS 抖动。
+///
+/// 和 `stadium_track` 的区别：尺寸可变、起点带一小段"从入口走到跑道"的尾巴、
+/// 每圈叠加相关的 GPS 噪声，所以多圈不会完全重合，而是像真机那样一簇椭圆。
+pub fn campus_oval_track(
+    center: (f64, f64),
+    spec: &OvalSpec,
+    sample_step_m: f64,
+    seed: u64,
+) -> Vec<(f64, f64)> {
+    use rand::{Rng, SeedableRng};
+    let OvalSpec { straight, radius, heading, laps } = *spec;
+    let lap = 2.0 * straight + 2.0 * std::f64::consts::PI * radius;
+    let total = lap * laps;
+    let n = ((total / sample_step_m).ceil() as usize).max(16) + 1;
+    let m_lng = m_per_deg_lng(center.0);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+    // 相关 GPS 噪声（OU）：沿轨迹与垂直轨迹各一维，相邻点有惯性 → 多圈成"带"。
+    let (mut jx, mut jy) = (0.0f64, 0.0f64);
+    let theta = 0.15;
+    let sigma = 1.1;
+    let gauss = |rng: &mut rand::rngs::StdRng| {
+        let u1: f64 = rng.gen::<f64>().max(1e-12);
+        let u2: f64 = rng.gen();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    };
+
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(n + 8);
+
+    // 入场尾巴：从跑道起点往场外偏 15~35m 的一点走进来。
+    let start = point_at_dim(0.0, straight, radius, heading);
+    let tail_len: f64 = rng.gen_range(15.0..35.0);
+    let tail_ang: f64 = rng.gen_range(0.0..std::f64::consts::TAU);
+    let entry = (
+        start.0 + tail_len * tail_ang.cos(),
+        start.1 + tail_len * tail_ang.sin(),
+    );
+    let tail_n = ((tail_len / sample_step_m).ceil() as usize).max(2);
+    for k in 0..tail_n {
+        let t = k as f64 / tail_n as f64;
+        let x = entry.0 + (start.0 - entry.0) * t;
+        let y = entry.1 + (start.1 - entry.1) * t;
+        out.push((center.0 + y / M_PER_DEG_LAT, center.1 + x / m_lng));
+    }
+
+    for i in 0..n {
+        let s = total * i as f64 / (n - 1) as f64;
+        let (x, y) = point_at_dim(s, straight, radius, heading);
+        jx += -theta * jx + sigma * gauss(&mut rng);
+        jy += -theta * jy + sigma * gauss(&mut rng);
+        let lat = center.0 + (y + jy) / M_PER_DEG_LAT;
+        let lng = center.1 + (x + jx) / m_lng;
+        out.push((lat, lng));
+    }
+    out
+}
+
 /// 生成绕 `laps` 圈的轨迹（经纬度）。
 ///
 /// `sample_step_m` 是采样间距（米），保证直道和弯道都有足够采样点。
