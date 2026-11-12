@@ -414,6 +414,14 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         }
     };
 
+    // 拉到打卡点就记住校区中心（BD-09），之后没围栏时的兜底锚点用它，
+    // 不再拿成都坐标当跑者位置发给服务端。
+    if let Some((hl, hg)) = points::center_bd(&pt.coords) {
+        if let Some(uid) = client.credentials().and_then(|c| c.uid.as_deref()) {
+            crate::api::session::save_home(uid, hl, hg);
+        }
+    }
+
     // ④ 规划
     let cps: Vec<Checkpoint> = pt
         .coords
