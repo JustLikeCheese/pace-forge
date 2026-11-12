@@ -397,6 +397,7 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
             let body = read_json(&mut request)?;
             handle_raw(request, state, &body)
         }
+        (Method::Get, "/api/home") => handle_home(request, state),
         (Method::Get, "/api/health") => json_ok(request, json!({"ok": true, "version": crate::VERSION})),
         _ => {
             if let Some(rest) = path.strip_prefix("/api/accounts/") {
@@ -503,7 +504,11 @@ fn handle_plan(
                 }
             }
         }
-        if lat == 0.0 { lat = 30.5; lng = 104.0; }
+        if lat == 0.0 {
+            // 没围栏：用学到的校区中心，最后才退回默认值
+            let uid = st.current_account().map(|a| a.uid.clone()).unwrap_or_default();
+            (lat, lng) = home_or_default(&uid);
+        }
     }
 
     if distance_km <= 0.0 || distance_km > 42.0 {
@@ -1106,6 +1111,26 @@ fn handle_login_all(request: tiny_http::Request, state: Shared) -> Result<(), St
 }
 
 /// 批量刷：所有就绪账号依次跑一遍。
+/// 账号的校区中心（BD-09）；还没学到就退回默认值。
+fn home_or_default(uid: &str) -> (f64, f64) {
+    crate::api::session::load_home(uid).unwrap_or((30.5, 104.0))
+}
+
+/// GET /api/home：当前账号校区中心（GCJ-02，给高德底图居中用）。
+fn handle_home(request: tiny_http::Request, state: Shared) -> Result<(), String> {
+    let uid = {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        st.current_account().map(|a| a.uid.clone()).unwrap_or_default()
+    };
+    match crate::api::session::load_home(&uid) {
+        Some((lat, lng)) => {
+            let (glat, glng) = crate::api::coord::bd09_to_gcj02(lat, lng);
+            json_ok(request, json!({ "lat": glat, "lng": glng }))
+        }
+        None => json_err(request, "还没学到校区位置（先生成一次轨迹）"),
+    }
+}
+
 /// 按种子随机一组自洽的 (距离 km, 时长 min)。
 ///
 /// 区间来自 5 个账号共 ~50 条真机记分跑记录：距离绝大多数 2.0~2.1km（2.0 是
@@ -1214,7 +1239,12 @@ fn handle_batch(
             (distance_km, duration_min)
         };
 
+        // 锚点用该账号学到的校区中心，不用默认的成都坐标。
+        let (home_lat, home_lng) =
+            home_or_default(client.credentials().and_then(|c| c.uid.as_deref()).unwrap_or(""));
         let p = crate::api::flow::RunParams {
+            center_lat: home_lat,
+            center_lng: home_lng,
             distance_m: dist_km * 1000.0,
             duration_sec: (dur_min * 60.0).round() as i64,
             sport_type,
@@ -1538,7 +1568,9 @@ fn handle_run(
                     let s: (f64, f64) = r.iter().fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
                     (s.0 / n, s.1 / n)
                 }
-                _ => (30.5, 104.0),
+                _ => home_or_default(
+                    client.credentials().and_then(|c| c.uid.as_deref()).unwrap_or(""),
+                ),
             }
         }
     };

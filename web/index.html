@@ -871,6 +871,7 @@ function initMap() {
   // 当作瓦片坐标算 z/x/y。所以喂给 Leaflet 的必须是 GCJ-02——点位用
   // gcjLat/gcjLng，手绘出来的也是 GCJ-02，不能混用 BD-09。
   map = L.map('map', { zoomControl: true }).setView([47.3842, 123.9583], 16);
+  goHome(); // 有学到的校区就居中过去，别停在默认坐标
 
   const roadMap = L.tileLayer(
     'https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
@@ -1228,23 +1229,53 @@ async function ungzipB64(b64) {
   return await new Response(out).text();
 }
 
-async function obsTrack(rrid) {
-  const key = 'run_data/' + Math.floor(rrid / 1000000) + '/' + rrid + '.json';
-  try {
-    const j = await api('/api/obs/fetch', { method: 'POST', body: JSON.stringify({ key }) });
-    const obj = j.data ?? j;
-    if (!obj || !obj.run_data) return null;
-    const wrap = JSON.parse(await ungzipB64(obj.run_data));
-    const raw = wrap.allLocJson;
-    const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    if (!Array.isArray(arr)) return null;
-    // gLat/gLng 是 GCJ-02，lat/lng 是 BD-09；底图按 GCJ-02 走更贴合
-    return arr
-      .map(p => ({ lat: num(p.gLat) || num(p.lat), lng: num(p.gLng) || num(p.lng) }))
-      .filter(p => p.lat && p.lng);
-  } catch (e) {
-    return null;
+/// 候选 objectKey。真机记录只有 run_data/{本地小时}/{uuid}.json 一种；工具提交的
+/// 三种都传了。原来只试 rrid 那种，于是真机跑的记录明明有轨迹也显示"没有"。
+function obsKeys(rrid, uuid, startMs) {
+  const keys = [];
+  if (uuid && startMs) {
+    const hour = off => {
+      const d = new Date(startMs + off);
+      const p = n => String(n).padStart(2, '0');
+      return d.getUTCFullYear() + p(d.getUTCMonth() + 1) + p(d.getUTCDate()) + p(d.getUTCHours());
+    };
+    for (const u of new Set([uuid, uuid.toLowerCase(), uuid.toUpperCase()])) {
+      keys.push(`run_data/${hour(8 * 3600e3)}/${u}.json`); // 本地时区 UTC+8
+    }
+    keys.push(`run_data/${hour(0)}/${uuid}.json`);          // UTC 兜底
   }
+  if (rrid) keys.push('run_data/' + Math.floor(rrid / 1000000) + '/' + rrid + '.json');
+  return keys;
+}
+
+async function obsTrack(rrid, uuid, startMs) {
+  for (const key of obsKeys(rrid, uuid, startMs)) {
+    try {
+      const j = await api('/api/obs/fetch', { method: 'POST', body: JSON.stringify({ key }) });
+      const obj = j.data ?? j;
+      if (!obj || !obj.run_data) continue;
+      const wrap = JSON.parse(await ungzipB64(obj.run_data));
+      const raw = wrap.allLocJson;
+      const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!Array.isArray(arr)) continue;
+      // gLat/gLng 是 GCJ-02，lat/lng 是 BD-09；底图按 GCJ-02 走更贴合
+      const pts = arr
+        .map(p => ({ lat: num(p.gLat) || num(p.lat), lng: num(p.gLng) || num(p.lng) }))
+        .filter(p => p.lat > 0 && p.lng > 0);
+      if (pts.length > 1) return pts;
+    } catch (e) { /* 这个 key 没有，试下一个 */ }
+  }
+  return null;
+}
+
+/// 校区中心（GCJ-02）。没轨迹可画时地图居中到这里，而不是写死的成都。
+let homeCenter = null;
+async function goHome() {
+  if (!map) return;
+  if (!homeCenter) {
+    try { homeCenter = await api('/api/home'); } catch (_) { return; }
+  }
+  if (homeCenter && homeCenter.lat) map.setView([homeCenter.lat, homeCenter.lng], 17);
 }
 
 /* ---------- 单条详情 ---------- */
@@ -1264,7 +1295,7 @@ async function selectRec(r, el) {
     // 拉下来 → gzip 解压 → 取 run_data.allLocJson → 就能画线。
     if (pts.length <= 1) {
       $('detail').innerHTML = '<span class="spin"></span> 从 OBS 拉轨迹…';
-      const obs = await obsTrack(rrid);
+      const obs = await obsTrack(rrid, r.uuid ?? d.uuid, num(r.startTime ?? d.startTime));
       if (obs && obs.length > 1) pts = obs;
     }
     if (pts.length > 1) {
@@ -1275,11 +1306,10 @@ async function selectRec(r, el) {
       map.invalidateSize();
       $('detail').innerHTML = detailHtml(d, pts.length);
     } else {
-      map.setView([30.5, 104.0], 15);
+      await goHome();
       $('detail').innerHTML = detailHtml(d, 0) +
-        '<div style="margin-top:8px;color:var(--dim)">OBS 里也没有这条记录的轨迹对象：' +
-        '要么当时上传失败，要么 objectKey 对不上（旧版时区不稳，实测 11-07 那批 ' +
-        'UTC+8 的 key 全是 404）。这条记录在哪儿都画不出线。</div>';
+        '<div style="margin-top:8px;color:var(--dim)">OBS 里没找到这条记录的轨迹对象' +
+        '（几种 objectKey 都试过了），多半是当时上传失败。</div>';
     }
   } catch (e) {
     $('detail').innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';

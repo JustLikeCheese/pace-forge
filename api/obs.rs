@@ -71,6 +71,8 @@ pub fn put_object(signed_url: &str, payload: &[u8]) -> Result<(), String> {
             .send_bytes(payload)
         {
             Ok(_) => return Ok(()),
+            // 服务端明确拒绝（4xx/5xx）重试也没用，直接返回
+            Err(e @ ureq::Error::Status(..)) => return Err(format!("OBS PUT 失败: {e}")),
             Err(e) => last = format!("OBS PUT 失败: {e}"),
         }
     }
@@ -120,6 +122,8 @@ pub fn fetch_object(client: &Client, key: &str) -> Result<Value, String> {
                 return serde_json::from_str(&text)
                     .map_err(|e| format!("OBS 对象解析失败: {e}"));
             }
+            // 404 等是"对象不存在"，不是握手抖动，不重试
+            Err(e @ ureq::Error::Status(..)) => return Err(format!("OBS GET 失败: {e}")),
             Err(e) => last = format!("OBS GET 失败: {e}"),
         }
     }

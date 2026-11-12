@@ -53,6 +53,28 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
+/// 账号的校区中心（BD-09），从打卡点质心学来，存在 `home.json`。
+///
+/// 没配围栏的学校原来一律拿 (30.5, 104.0)（成都）兜底当定位锚点：拉打卡点
+/// 时把成都坐标当成跑者位置发给服务端，网页地图也跳到成都。这里记住真实
+/// 校区，之后所有兜底都用它。键是 uid；`"*"` 存最近一次，给还没学到的账号用。
+pub fn load_home(uid: &str) -> Option<(f64, f64)> {
+    let map: std::collections::HashMap<String, [f64; 2]> = read_json("home.json")?;
+    map.get(uid).or_else(|| map.get("*")).map(|v| (v[0], v[1]))
+}
+
+/// 记住账号的校区中心（BD-09）。
+pub fn save_home(uid: &str, lat: f64, lng: f64) {
+    if !(lat.is_finite() && lng.is_finite()) || (lat == 0.0 && lng == 0.0) {
+        return;
+    }
+    let mut map: std::collections::HashMap<String, [f64; 2]> =
+        read_json("home.json").unwrap_or_default();
+    map.insert(uid.to_string(), [lat, lng]);
+    map.insert("*".to_string(), [lat, lng]);
+    let _ = write_json("home.json", &map);
+}
+
 fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
     let text = std::fs::read_to_string(data_dir().join(name)).ok()?;
     serde_json::from_str(&text).ok()
