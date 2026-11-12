@@ -192,7 +192,9 @@ impl Default for RunParams {
             run_mode: 1,
             steps: None,
             seed: 0,
-            sample_step_m: 5.0,
+            // 10m：真机 GPS 采样 ~10m 一个点（2km≈200 点）。早先 5m 会有 400 点，
+            // 点数翻倍是密度指纹，且低于 flow 校验的 8m 阈值。
+            sample_step_m: 10.0,
             prefer_roads: true,
             start_at_ms: None,
             custom_path: None,
@@ -525,6 +527,119 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             "[track] 手绘轨迹缩放后 {:.0}m（原 {drawn:.0}m），{n} 点",
             actual
         ));
+        crate::track::PlanResult {
+            points: pts
+                .into_iter()
+                .zip(times)
+                .map(|((lat, lng), t)| crate::track::TrackPoint { lat, lon: lng, time_ms: t })
+                .collect(),
+            checkpoints: cps.clone(),
+            actual_length_m: actual,
+        }
+    } else if p.run_mode == 1 && !cps.is_empty() {
+        // 记分跑 = 操场绕圈。真机轨迹是绕一个 ~280m 椭圆跑道跑 7 圈（偶尔 400m
+        // 跑道 4.5 圈），不是满场的自由折线。这里按真实形状生成：圆心取打卡点
+        // 质心（打卡点就在跑道上），朝向按打卡点主轴（对齐真实跑道走向），
+        // 尺寸/圈数/入场尾巴/GPS 抖动都随机，最后把打卡点吸附到最近的圈上点。
+        let seed = if p.seed != 0 { p.seed } else { start_ms as u64 };
+        // 全体打卡点质心，先用来找出"场心"那个点。
+        let gx = cps.iter().map(|c| c.lat).sum::<f64>() / cps.len() as f64;
+        let gy = cps.iter().map(|c| c.lng).sum::<f64>() / cps.len() as f64;
+        let klat = crate::track::geo::m_per_deg_lat(gx);
+        let klng = crate::track::geo::m_per_deg_lng(gx);
+        // 「田径场中」在场地内部，不是跑道外框的角，拿它算朝向/尺寸会把椭圆
+        // 带偏、变圆。剔除离质心最近的那个点（就是场心），只用四角定跑道。
+        let center_idx = (0..cps.len())
+            .min_by(|&a, &b| {
+                let da = ((cps[a].lat - gx) * klat).hypot((cps[a].lng - gy) * klng);
+                let db = ((cps[b].lat - gx) * klat).hypot((cps[b].lng - gy) * klng);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(0);
+        let corners: Vec<&Checkpoint> = cps
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != center_idx || cps.len() <= 2)
+            .map(|(_, c)| c)
+            .collect();
+        // 椭圆圆心 = 四角质心（真机跑道中心≈四角中心）。
+        let cx = corners.iter().map(|c| c.lat).sum::<f64>() / corners.len() as f64;
+        let cy = corners.iter().map(|c| c.lng).sum::<f64>() / corners.len() as f64;
+        // 四角 PCA（二阶矩）取长轴方向——矩形的主轴是长边，不是对角线，所以
+        // 比"最大跨度扫描"（会选到对角线）更对。真机这块场地算出 ~91°（竖向）。
+        let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
+        for c in &corners {
+            let dx = (c.lng - cy) * klng;
+            let dy = (c.lat - cx) * klat;
+            sxx += dx * dx;
+            syy += dy * dy;
+            sxy += dx * dy;
+        }
+        let heading = if corners.len() >= 2 {
+            0.5 * (2.0 * sxy).atan2(sxx - syy)
+        } else {
+            0.0
+        };
+        // 沿长轴/短轴量四角跨度。
+        let span = |h: f64| {
+            let (st, ct) = h.sin_cos();
+            let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+            for c in &corners {
+                let u = (c.lng - cy) * klng * ct + (c.lat - cx) * klat * st;
+                lo = lo.min(u);
+                hi = hi.max(u);
+            }
+            hi - lo
+        };
+        let major = span(heading);
+        let minor = span(heading + std::f64::consts::FRAC_PI_2);
+        // 真机跑道比四角外框大 ~35%（实测长107/宽52 对 外框78/38）。据此放大，
+        // 半径夹到真机实测 20~30m。
+        const FIELD_TO_TRACK: f64 = 1.35;
+        let radius = (minor * FIELD_TO_TRACK / 2.0).clamp(20.0, 30.0);
+        let straight = (major * FIELD_TO_TRACK - 2.0 * radius).clamp(35.0, 140.0);
+        let lap = 2.0 * straight + 2.0 * std::f64::consts::PI * radius;
+        let spec = crate::track::OvalSpec {
+            straight,
+            radius,
+            heading,
+            laps: (p.distance_m / lap).max(1.0),
+        };
+        log(&format!(
+            "[track] 操场绕圈：直道{:.0}m 半径{:.0}m 朝向{:.0}° {:.1}圈，{} 个必经点",
+            spec.straight, spec.radius, spec.heading.to_degrees(), spec.laps, cps.len()
+        ));
+        let mut pts = crate::track::campus_oval_track((cx, cy), &spec, p.sample_step_m, seed);
+        // 四角打卡点真实尺寸椭圆天然就在 20m 内；只有「田径场中」这种在椭圆
+        // 内部的点可能差 20m+。对这种点用**平滑凸起**而不是硬吸附：把最近那
+        // 一圈的一小段点按余弦渐变整体拉向它，形成柔和外凸，不戳尖刺。
+        for c in &cps {
+            let target = (c.lat, c.lng);
+            let (mut bi, mut bd) = (usize::MAX, f64::MAX);
+            for (i, q) in pts.iter().enumerate() {
+                let d = crate::track::geo::distance(*q, target);
+                if d < bd { bd = d; bi = i; }
+            }
+            // 已在 16m 内就不动；差太远（>45m，可能是坐标异常）也不硬拉。
+            if bi == usize::MAX || bd <= 16.0 || bd > 45.0 { continue; }
+            let base = pts[bi];
+            let (dlat, dlng) = (target.0 - base.0, target.1 - base.1);
+            // 凸起半宽：差得越远铺得越宽，保证坡度平缓（每点 ≤ ~2m）
+            let w = ((bd / p.sample_step_m).ceil() as usize).clamp(4, 14);
+            for k in 0..=(2 * w) {
+                let idx = bi as isize - w as isize + k as isize;
+                if idx < 0 || idx as usize >= pts.len() { continue; }
+                let idx = idx as usize;
+                // 余弦窗：中心 1，两端 0
+                let t = (k as f64 - w as f64) / w as f64; // -1..1
+                let wgt = 0.5 * (1.0 + (std::f64::consts::PI * t).cos());
+                pts[idx].0 += dlat * wgt;
+                pts[idx].1 += dlng * wgt;
+            }
+        }
+        let n = pts.len();
+        let times = crate::track::planner::assign_times(n, start_ms, p.duration_sec);
+        let actual = crate::track::geo::path_length(&pts);
         crate::track::PlanResult {
             points: pts
                 .into_iter()
