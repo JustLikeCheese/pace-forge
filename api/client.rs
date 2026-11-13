@@ -399,6 +399,12 @@ impl Client {
         // 有些接口 decryptResponse=false，直接返回业务 JSON。探测：无 r 字段即明文。
         let looks_encrypted = text.contains("\"r\"") && text.contains("\"v\"");
         if !looks_encrypted {
+            // 既不是加密信封也不是 JSON：多半是 WAF/网关拦截页（例如海外 IP 被挡）。
+            // 带上状态码和原文开头，否则上层只能报一句"不是 JSON"，查不出原因。
+            if serde_json::from_str::<Value>(&text).is_err() {
+                let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                return Err(format!("HTTP {status} 非 JSON 响应: {}", truncate(&one_line, 200)));
+            }
             return Ok(text);
         }
 
