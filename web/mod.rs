@@ -397,9 +397,7 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
             let body = read_json(&mut request)?;
             handle_raw(request, state, &body)
         }
-        (Method::Get, "/api/home") => handle_home(request, state),
-        (Method::Get, "/api/pace-range") => handle_pace_range(request, state),
-        (Method::Get, "/api/health") => json_ok(request, json!({"ok": true, "version": crate::VERSION})),
+        (Method::Get, "/api/home") => handle_home(request, state),        (Method::Get, "/api/health") => json_ok(request, json!({"ok": true, "version": crate::VERSION})),
         _ => {
             if let Some(rest) = path.strip_prefix("/api/accounts/") {
                 // /api/accounts/{id}/switch  |  /api/accounts/{id}  (DELETE)
@@ -1132,60 +1130,21 @@ fn handle_home(request: tiny_http::Request, state: Shared) -> Result<(), String>
     }
 }
 
-/// 账号自己的历史配速区间（分/km）。
-///
-/// 时长不能固定 12 分钟：真机每次时长都不一样（吕益铭 13:54 / 15:01 / 16:48 /
-/// 18:57…）。这里拉该账号最近的记分跑记录，取配速的 p10~p90 作为随机区间。
-/// 排除恰好 720s 的记录（早先工具按 12:00 交的，不是真人节奏），不足 3 条
-/// 时退回 5 账号整体区间。
-fn history_pace_range(client: &Client) -> (f64, f64) {
-    const FALLBACK: (f64, f64) = (5.6, 7.8);
-    let Ok(v) = records::list_records(client, 1, 30, 1) else { return FALLBACK };
-    let mut paces: Vec<f64> = v["records"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|r| {
-                    let d = r["totalDistance"].as_f64()?;
-                    let t = r["totalTime"].as_f64()?;
-                    (d > 1500.0 && t > 300.0 && (t - 720.0).abs() > 0.5)
-                        .then(|| t / 60.0 / (d / 1000.0))
-                })
-                .filter(|p| (4.0..=11.0).contains(p))
-                .collect()
-        })
-        .unwrap_or_default();
-    if paces.len() < 3 {
-        return FALLBACK;
-    }
-    paces.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let q = |f: f64| paces[((paces.len() - 1) as f64 * f).round() as usize];
-    let (lo, hi) = (q(0.1), q(0.9));
-    if hi - lo < 0.4 { (lo - 0.2, hi + 0.2) } else { (lo, hi) }
-}
+/// 随机配速区间（分/km）。取 5 个账号真机记分跑的整体范围（p10~p90 ≈
+/// 5.4~7.9），2.0~2.4km 对应时长约 11~19 分钟，不再固定 12 分钟。
+const PACE_RANGE: (f64, f64) = (5.6, 7.8);
 
 /// 按种子随机一组自洽的 (距离 km, 时长 min)。
 ///
-/// 距离 2.0~2.4km；配速在账号历史区间里随机，时长 = 距离 × 配速（精确到秒），
+/// 距离 2.0~2.4km；配速在 PACE_RANGE 里随机，时长 = 距离 × 配速（精确到秒），
 /// 步数由配速推导，三者保持 `v = 步频/60 × 步幅` 自洽。
-fn rand_run_spec(seed: u64, pace: (f64, f64)) -> (f64, f64) {
+fn rand_run_spec(seed: u64) -> (f64, f64) {
     use rand::{Rng, SeedableRng};
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let dist = (rng.gen_range(2.00_f64..=2.40) * 100.0).round() / 100.0;
-    let p = rng.gen_range(pace.0.min(pace.1)..=pace.0.max(pace.1));
+    let p = rng.gen_range(PACE_RANGE.0..=PACE_RANGE.1);
     let dur = (dist * p * 60.0).round() / 60.0; // 分钟，落到整秒
     (dist, dur)
-}
-
-/// GET /api/pace-range：当前账号历史配速区间，前端用它填默认值。
-fn handle_pace_range(request: tiny_http::Request, state: Shared) -> Result<(), String> {
-    let client = {
-        let st = state.lock().map_err(|e| e.to_string())?;
-        st.client().cloned()
-    };
-    let Some(client) = client else { return json_err(request, "请先登录") };
-    let (lo, hi) = history_pace_range(&client);
-    json_ok(request, json!({ "min": (lo * 100.0).round() / 100.0, "max": (hi * 100.0).round() / 100.0 }))
 }
 
 /// 每个账号一个稳定但互不相同的随机种子（账号 id 混入时刻，每次批量都变）。
@@ -1276,7 +1235,7 @@ fn handle_batch(
         // 每账号各自随机：距离/时长/种子都不同，于是轨迹、步数、配速都不同。
         let seed = account_seed(id, batch_salt);
         let (dist_km, dur_min) = if random {
-            rand_run_spec(seed, history_pace_range(&client))
+            rand_run_spec(seed)
         } else {
             (distance_km, duration_min)
         };
