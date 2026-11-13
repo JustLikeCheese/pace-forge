@@ -419,8 +419,6 @@ function syncDist() {
   if (el) { el.oninput = syncDist; el.onchange = syncDist; }
 });
 syncDist();
-// 用户手改配速区间后，不再被账号历史区间覆盖
-['rPaceMin', 'rPaceMax'].forEach(id => $(id).addEventListener('input', () => { paceTouched = true; }));
 
 $('planBtn').onclick = async () => {
   let st = null;
@@ -644,29 +642,10 @@ function drawPreview(coords, fence, checkpoints) {
 
 /* ---------- 账号管理 ---------- */
 
-/// 用当前账号的历史配速区间填默认值：时长 = 距离 × 区间内随机配速，
-/// 不再固定在 12 分钟附近。用户手改过区间就不覆盖。
-let paceTouched = false;
-let paceAccount = null;
-async function refreshPaceRange(accountId) {
-  if (paceTouched || !accountId || accountId === paceAccount) return;
-  try {
-    const r = await api('/api/pace-range');
-    if (r && r.min > 0 && r.max > 0) {
-      $('rPaceMin').value = r.min.toFixed(1);
-      $('rPaceMax').value = r.max.toFixed(1);
-      paceAccount = accountId;
-      syncDurHint();
-    }
-  } catch (_) {}
-}
-
 async function loadAccounts() {
   try {
     const r = await api('/api/accounts');
     renderAccounts(r);
-    const cur = (r.accounts || []).find(a => a.current && a.loggedIn);
-    if (cur) refreshPaceRange(cur.id);
     return r;
   } catch (e) {
     $('accList').innerHTML = `<div class="msg err">${e.message}</div>`;
