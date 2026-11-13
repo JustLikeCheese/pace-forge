@@ -202,9 +202,9 @@ button.danger:disabled{opacity:.5}
       <label>距离 km<input id="rDist" type="number" value="2.0" step="0.1" min="0.5" max="21"></label>
       <label>配速 分/km
         <span style="display:inline-flex;gap:4px;align-items:center">
-          <input id="rPaceMin" type="number" value="5.5" step="0.1" min="2" max="12" style="width:64px">
+          <input id="rPaceMin" type="number" value="5.6" step="0.1" min="2" max="12" style="width:64px">
           ~
-          <input id="rPaceMax" type="number" value="6.6" step="0.1" min="2" max="12" style="width:64px">
+          <input id="rPaceMax" type="number" value="7.8" step="0.1" min="2" max="12" style="width:64px">
         </span>
       </label>
       <label title="按上面的配速区间随机取一个配速，乘距离得到时长；每次提交都重新随机">
@@ -419,6 +419,8 @@ function syncDist() {
   if (el) { el.oninput = syncDist; el.onchange = syncDist; }
 });
 syncDist();
+// 用户手改配速区间后，不再被账号历史区间覆盖
+['rPaceMin', 'rPaceMax'].forEach(id => $(id).addEventListener('input', () => { paceTouched = true; }));
 
 $('planBtn').onclick = async () => {
   let st = null;
@@ -642,10 +644,29 @@ function drawPreview(coords, fence, checkpoints) {
 
 /* ---------- 账号管理 ---------- */
 
+/// 用当前账号的历史配速区间填默认值：时长 = 距离 × 区间内随机配速，
+/// 不再固定在 12 分钟附近。用户手改过区间就不覆盖。
+let paceTouched = false;
+let paceAccount = null;
+async function refreshPaceRange(accountId) {
+  if (paceTouched || !accountId || accountId === paceAccount) return;
+  try {
+    const r = await api('/api/pace-range');
+    if (r && r.min > 0 && r.max > 0) {
+      $('rPaceMin').value = r.min.toFixed(1);
+      $('rPaceMax').value = r.max.toFixed(1);
+      paceAccount = accountId;
+      syncDurHint();
+    }
+  } catch (_) {}
+}
+
 async function loadAccounts() {
   try {
     const r = await api('/api/accounts');
     renderAccounts(r);
+    const cur = (r.accounts || []).find(a => a.current && a.loggedIn);
+    if (cur) refreshPaceRange(cur.id);
     return r;
   } catch (e) {
     $('accList').innerHTML = `<div class="msg err">${e.message}</div>`;
@@ -844,7 +865,10 @@ $('accBatch').onclick = async () => {
       })
     });
     const lines = (r.results || []).map(x => {
-      const tgt = (x.targetKm != null) ? ` [${x.targetKm}km/${x.targetMin}min]` : '';
+      const ts = x.targetSec;
+      const tgt = (x.targetKm != null)
+        ? ` [${x.targetKm}km / ${ts != null ? Math.floor(ts / 60) + ':' + String(ts % 60).padStart(2, '0') : x.targetMin + 'min'}]`
+        : '';
       if (x.ok && x.submitted) return `✓ ${x.id}${tgt} → 记录 #${x.recordId}`;
       if (x.ok) return `· ${x.id}${tgt} 未提交`;
       return `✗ ${x.id} → ${x.error}`;
