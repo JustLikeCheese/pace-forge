@@ -52,6 +52,8 @@ fn main() {
             }
         }
         "semester" => show_semester(),
+        "daily" => do_daily(&args[1..]),
+        "export-ci" => do_export_ci(),
         "logout" => do_logout(),
         "relogin" => do_relogin(),
         "check" => {
@@ -130,6 +132,9 @@ fn main() {
             println!("  pace-forge ago <分钟> [km] [min]            补跑：N 分钟前");
             println!("  pace-forge rand [km] [min] [--days N]       补跑：当天 7-20 点随机时刻");
             println!("  pace-forge stadium [圈] [道次] 操场轨迹参数");
+            println!("  pace-forge daily [--dry] [--result F] [--delay-max-min N] [--gap-sec A-B] [--only 1,3]");
+            println!("                                 每日批量（账号读环境变量 PACE_ACCOUNTS）");
+            println!("  pace-forge export-ci           从本机账号库导出 PACE_ACCOUNTS（含密码，只写 stdout）");
             println!("  pace-forge version             版本号");
             println!();
             println!("规则：开始 + 用时 + 5s 余量 ≤ 现在，最多往前补 3 天。");
@@ -217,6 +222,87 @@ fn dry_run(dist_km: f64, dur_min: f64) {
 }
 
 /// 完全离线的轨迹体检：不登录、不联网，只看本地合成的数据像不像真跑。
+/// 每日批量：账号从环境变量 `PACE_ACCOUNTS` 读，结果写 `--result`。
+/// 有账号失败时退出码 1（跳过不算失败）。
+fn do_daily(args: &[String]) {
+    use pace_forge::api::daily::{run_daily, DailyConfig, DailyOptions};
+    let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let mut opt = DailyOptions { dry: args.iter().any(|a| a == "--dry"), ..Default::default() };
+    if let Some(m) = flag("--delay-max-min").and_then(|s| s.parse::<u64>().ok()) {
+        opt.start_delay_max_s = m * 60;
+    }
+    if let Some(g) = flag("--gap-sec") {
+        let mut it = g.split('-').filter_map(|x| x.trim().parse::<u64>().ok());
+        if let (Some(a), Some(b)) = (it.next(), it.next()) {
+            opt.gap_s = (a.min(b), a.max(b));
+        }
+    }
+    if let Some(o) = flag("--only") {
+        opt.only = o.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    }
+    let raw = std::env::var("PACE_ACCOUNTS").unwrap_or_default();
+    let cfg: DailyConfig = match serde_json::from_str(&raw) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("PACE_ACCOUNTS 缺失或格式不对: {e}");
+            if let Some(p) = flag("--result") {
+                let _ = std::fs::write(p, r#"{"error_code":"configuration_failed","accounts":[]}"#);
+            }
+            std::process::exit(1);
+        }
+    };
+    let res = run_daily(&cfg, &opt);
+    if let Some(p) = flag("--result") {
+        if let Err(e) = std::fs::write(&p, serde_json::to_string_pretty(&res).unwrap_or_default()) {
+            eprintln!("写结果失败: {e}");
+        }
+    }
+    let accts = res["accounts"].as_array().cloned().unwrap_or_default();
+    let ok = accts.iter().filter(|a| a["status"] == "success").count();
+    let skip = accts.iter().filter(|a| a["status"] == "skipped").count();
+    let fail = accts.len() - ok - skip;
+    println!("完成：成功 {ok} · 跳过 {skip} · 失败 {fail}");
+    if fail > 0 {
+        std::process::exit(1);
+    }
+}
+
+/// 从本机账号库导出 `PACE_ACCOUNTS`：解密密码 + 本机设备 ID + 校区中心。
+/// 输出含明文密码，只写 stdout，用来直接管道给 `gh secret set`。
+fn do_export_ci() {
+    use pace_forge::api::{accounts, client::DeviceProfile, session};
+    let book = accounts::load();
+    let mut list = Vec::new();
+    for a in &book.accounts {
+        if a.password_enc.is_empty() {
+            eprintln!("跳过 {}：没存密码", a.id);
+            continue;
+        }
+        let pw = match accounts::open_password(&a.password_enc) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("跳过 {}：密码解不开（{e}）", a.id);
+                continue;
+            }
+        };
+        let mut item = serde_json::json!({
+            "username": a.username,
+            "password": pw,
+            "device_id": DeviceProfile::local_device_id(&a.username),
+        });
+        if let Some((lat, lng)) = session::load_home(&a.uid) {
+            item["home"] = serde_json::json!([lat, lng]);
+        }
+        list.push(item);
+    }
+    let mut out = serde_json::json!({ "accounts": list });
+    if let Some((lat, lng)) = session::load_home("*") {
+        out["home"] = serde_json::json!([lat, lng]);
+    }
+    eprintln!("导出 {} 个账号（stdout 含明文密码，别贴到任何地方）", list.len());
+    println!("{out}");
+}
+
 fn local_check(dist_km: f64, dur_min: f64) {
     use pace_forge::track::{
         buckets::{make_jitter, speed_buckets},

@@ -432,7 +432,7 @@ fn handle_login(request: tiny_http::Request, state: Shared, body: &Value) -> Res
         return json_err(request, "手机号和密码都要填");
     }
 
-    let mut client = Client::new(DeviceProfile::default());
+    let mut client = Client::new(DeviceProfile::for_account(&username));
     match login(&mut client, &username, &password) {
         Ok(LoginOutcome::Ok(profile)) => {
             let mut st = state.lock().map_err(|e| e.to_string())?;
@@ -1053,7 +1053,7 @@ fn handle_login_one(
         }
     };
 
-    let mut client = Client::new(DeviceProfile::default());
+    let mut client = Client::new(DeviceProfile::for_account(&username));
     match login(&mut client, &username, &password) {
         Ok(LoginOutcome::Ok(profile)) => {
             let mut st = state.lock().map_err(|e| e.to_string())?;
@@ -1091,7 +1091,7 @@ fn handle_login_all(request: tiny_http::Request, state: Shared) -> Result<(), St
             // 错开，避免同 IP 短时间连续登录触发风控
             std::thread::sleep(std::time::Duration::from_millis(1500));
         }
-        let mut client = Client::new(DeviceProfile::default());
+        let mut client = Client::new(DeviceProfile::for_account(user));
         match login(&mut client, user, pass) {
             Ok(LoginOutcome::Ok(profile)) => {
                 let mut st = state.lock().map_err(|e| e.to_string())?;
@@ -1130,22 +1130,7 @@ fn handle_home(request: tiny_http::Request, state: Shared) -> Result<(), String>
     }
 }
 
-/// 随机配速区间（分/km）。取 5 个账号真机记分跑的整体范围（p10~p90 ≈
-/// 5.4~7.9），2.0~2.4km 对应时长约 11~19 分钟，不再固定 12 分钟。
-const PACE_RANGE: (f64, f64) = (5.6, 7.8);
-
-/// 按种子随机一组自洽的 (距离 km, 时长 min)。
-///
-/// 距离 2.0~2.4km；配速在 PACE_RANGE 里随机，时长 = 距离 × 配速（精确到秒），
-/// 步数由配速推导，三者保持 `v = 步频/60 × 步幅` 自洽。
-fn rand_run_spec(seed: u64) -> (f64, f64) {
-    use rand::{Rng, SeedableRng};
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let dist = (rng.gen_range(2.00_f64..=2.40) * 100.0).round() / 100.0;
-    let p = rng.gen_range(PACE_RANGE.0..=PACE_RANGE.1);
-    let dur = (dist * p * 60.0).round() / 60.0; // 分钟，落到整秒
-    (dist, dur)
-}
+use crate::api::flow::random_run_spec as rand_run_spec;
 
 /// 每个账号一个稳定但互不相同的随机种子（账号 id 混入时刻，每次批量都变）。
 fn account_seed(id: &str, salt: u64) -> u64 {

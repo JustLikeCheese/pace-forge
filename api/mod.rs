@@ -3,6 +3,7 @@
 pub mod accounts;
 pub mod start_time;
 pub mod client;
+pub mod daily;
 pub mod coord;
 pub mod fence;
 pub mod obs;
