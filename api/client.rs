@@ -59,9 +59,24 @@ impl DeviceProfile {
     /// 不同账号拿到不同的，避免被按设备聚合。
     pub fn for_account(scope: &str) -> Self {
         let device_id = persistent_device_id(scope);
-        let mut d = Self { device_id: device_id.clone(), ..Self::base() };
-        d.fill_derived_identity(&device_id);
+        Self::with_device_id(&device_id)
+    }
+
+    /// 用指定的 device_id 构造（其余标识按它确定性派生）。
+    ///
+    /// 给无状态环境用（GitHub Actions 每次都是全新机器）：本机生成的
+    /// device_id 存在 `~/.pace-forge-device-id-*` 里，CI 拿不到就会每天随机
+    /// 一个新的，等于每天换一台手机登录。把本机的 id 放进配置传进来，CI
+    /// 就和本机是"同一台手机"。
+    pub fn with_device_id(device_id: &str) -> Self {
+        let mut d = Self { device_id: device_id.to_string(), ..Self::base() };
+        d.fill_derived_identity(device_id);
         d
+    }
+
+    /// 某账号在本机持久化的 device_id（没有就生成并落盘）。导出 CI 配置用。
+    pub fn local_device_id(scope: &str) -> String {
+        persistent_device_id(scope)
     }
 
     /// 由 device_id 派生其余设备标识。

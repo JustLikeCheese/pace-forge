@@ -1296,6 +1296,23 @@ pub fn run_full(
 /// 服务端会在提交后一段时间内拒绝新的跑步请求。提前再发就会被判异常。
 pub const SILENCE_SEC: i64 = 600;
 
+/// 随机配速区间（分/km）。取 5 个账号真机记分跑的整体范围（p10~p90 ≈
+/// 5.4~7.9），2.0~2.4km 对应时长约 11~19 分钟，不再固定 12 分钟。
+pub const PACE_RANGE: (f64, f64) = (5.6, 7.8);
+
+/// 按种子随机一组自洽的 (距离 km, 时长 min)。
+///
+/// 距离 2.0~2.4km；配速在 PACE_RANGE 里随机，时长 = 距离 × 配速（精确到秒），
+/// 步数由配速推导，三者保持 `v = 步频/60 × 步幅` 自洽。
+pub fn random_run_spec(seed: u64) -> (f64, f64) {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let dist = (rng.gen_range(2.00_f64..=2.40) * 100.0).round() / 100.0;
+    let p = rng.gen_range(PACE_RANGE.0..=PACE_RANGE.1);
+    let dur = (dist * p * 60.0).round() / 60.0; // 分钟，落到整秒
+    (dist, dur)
+}
+
 /// 判断距离上次提交是否已过静默窗口。
 pub fn silence_ok(last_submit_ms: i64, now_ms: i64) -> bool {
     now_ms - last_submit_ms >= SILENCE_SEC * 1000
