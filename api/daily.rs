@@ -43,6 +43,9 @@ pub struct DailyAccount {
     pub device_id: Option<String>,
     #[serde(default)]
     pub home: Option<[f64; 2]>,
+    /// 显示名（姓名），只进加密的面板数据
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -283,7 +286,11 @@ pub fn run_daily(cfg: &DailyConfig, opt: &DailyOptions) -> Value {
         }
         let acc = &cfg.accounts[i];
         let home = acc.home.map(|h| (h[0], h[1])).unwrap_or(fallback);
-        results.push(run_one(i + 1, acc, home, opt));
+        let mut r = run_one(i + 1, acc, home, opt);
+        if let Some(n) = acc.name.as_deref().filter(|n| !n.is_empty()) {
+            r["name"] = json!(n);
+        }
+        results.push(r);
     }
     results.sort_by_key(|r| r["index"].as_u64().unwrap_or(0));
 

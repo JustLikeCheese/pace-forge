@@ -289,6 +289,7 @@ fn do_export_ci() {
             "username": a.username,
             "password": pw,
             "device_id": DeviceProfile::local_device_id(&a.username),
+            "name": a.name,
         });
         if let Some((lat, lng)) = session::load_home(&a.uid) {
             item["home"] = serde_json::json!([lat, lng]);
