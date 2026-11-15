@@ -53,6 +53,7 @@ fn main() {
         }
         "semester" => show_semester(),
         "daily" => do_daily(&args[1..]),
+        "history" => do_history(&args[1..]),
         "export-ci" => do_export_ci(),
         "logout" => do_logout(),
         "relogin" => do_relogin(),
@@ -224,6 +225,35 @@ fn dry_run(dist_km: f64, dur_min: f64) {
 /// 完全离线的轨迹体检：不登录、不联网，只看本地合成的数据像不像真跑。
 /// 每日批量：账号从环境变量 `PACE_ACCOUNTS` 读，结果写 `--result`。
 /// 有账号失败时退出码 1（跳过不算失败）。
+/// history --index N [--size 20] --out 结果.json：拉某账号记录与轨迹（账号来自 PACE_ACCOUNTS）
+fn do_history(args: &[String]) {
+    use pace_forge::api::{daily::DailyConfig, history::account_history};
+    let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let index: usize = flag("--index").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let size: u32 = flag("--size").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let cfg: DailyConfig = match serde_json::from_str(&std::env::var("PACE_ACCOUNTS").unwrap_or_default()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("PACE_ACCOUNTS 缺失或格式不对: {e}");
+            std::process::exit(1);
+        }
+    };
+    let res = account_history(&cfg, index, size);
+    let text = serde_json::to_string(&res).unwrap_or_default();
+    match flag("--out") {
+        Some(p) => {
+            if let Err(e) = std::fs::write(&p, text) {
+                eprintln!("写结果失败: {e}");
+                std::process::exit(1);
+            }
+        }
+        None => println!("{text}"),
+    }
+    if res.get("error_code").is_some() {
+        std::process::exit(1);
+    }
+}
+
 fn do_daily(args: &[String]) {
     use pace_forge::api::daily::{run_daily, DailyConfig, DailyOptions};
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();

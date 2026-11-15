@@ -140,8 +140,10 @@ fn result(index: usize, status: &str, code: Option<&str>, extra: Value) -> Value
     v
 }
 
-fn run_one(index: usize, acc: &DailyAccount, home: (f64, f64), opt: &DailyOptions) -> Value {
-    let tag = format!("[{index}]");
+/// 按配置登录一个账号（用它固定的设备 ID）。极验偶尔识别失败（缺口 distance=0 之类），
+/// 整轮重登最多 3 次；密码错、账号被锁（10121）不重试，免得把锁续上。
+/// 失败返回固定错误码：login_failed / login_locked。
+pub fn login_account(acc: &DailyAccount, tag: &str) -> Result<Client, &'static str> {
     let device = match acc.device_id.as_deref().filter(|d| d.len() == 32) {
         Some(id) => DeviceProfile::with_device_id(id),
         None => {
@@ -150,9 +152,6 @@ fn run_one(index: usize, acc: &DailyAccount, home: (f64, f64), opt: &DailyOption
         }
     };
     let mut client = Client::new(device);
-
-    // ① 登录。极验偶尔识别失败（缺口 distance=0 之类），整轮重登最多 3 次；
-    //    密码错、账号被锁（10121）不重试，免得把锁续上
     let mut attempt = 1;
     let outcome = loop {
         let r = login::login(&mut client, &acc.username, &acc.password);
@@ -169,17 +168,37 @@ fn run_one(index: usize, acc: &DailyAccount, home: (f64, f64), opt: &DailyOption
         std::thread::sleep(std::time::Duration::from_secs(rand_between(8, 20)));
     };
     match outcome {
-        Ok(LoginOutcome::Ok(_)) => println!("{tag} √ 登录成功"),
+        Ok(LoginOutcome::Ok(_)) => {
+            println!("{tag} √ 登录成功");
+            Ok(client)
+        }
         Ok(LoginOutcome::NeedCaptcha { message, .. }) => {
             println!("{tag} × 登录未过验证：{message}");
-            return result(index, "failure", Some("login_failed"), json!({}));
+            Err("login_failed")
         }
         Err(e) => {
             println!("{tag} × 登录失败：{e}");
-            let code = if e.contains("10121") || e.contains("其他设备") { "login_locked" } else { "login_failed" };
-            return result(index, "failure", Some(code), json!({}));
+            Err(if e.contains("10121") || e.contains("其他设备") { "login_locked" } else { "login_failed" })
         }
     }
+}
+
+/// 退出登录：服务端会话留着，第二天再登会 10121 锁一小时。
+pub fn logout_account(client: &mut Client, tag: &str) {
+    match login::logout(client) {
+        Ok(true) => println!("{tag} √ 已退出登录"),
+        Ok(false) => {}
+        Err(e) => println!("{tag} ⚠ 退出登录失败：{e}"),
+    }
+}
+
+fn run_one(index: usize, acc: &DailyAccount, home: (f64, f64), opt: &DailyOptions) -> Value {
+    let tag = format!("[{index}]");
+    // ① 登录
+    let mut client = match login_account(acc, &tag) {
+        Ok(c) => c,
+        Err(code) => return result(index, "failure", Some(code), json!({})),
+    };
 
     // ② 今天跑过就不再跑
     let out = match ran_today(&client) {
@@ -195,12 +214,8 @@ fn run_one(index: usize, acc: &DailyAccount, home: (f64, f64), opt: &DailyOption
         }
     };
 
-    // ③ 退出登录：服务端会话留着，第二天再登会 10121 锁一小时
-    match login::logout(&mut client) {
-        Ok(true) => println!("{tag} √ 已退出登录"),
-        Ok(false) => {}
-        Err(e) => println!("{tag} ⚠ 退出登录失败：{e}"),
-    }
+    // ③ 退出登录
+    logout_account(&mut client, &tag);
     out
 }
 
