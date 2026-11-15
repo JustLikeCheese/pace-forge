@@ -257,7 +257,11 @@ fn do_history(args: &[String]) {
 fn do_daily(args: &[String]) {
     use pace_forge::api::daily::{run_daily, DailyConfig, DailyOptions};
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let mut opt = DailyOptions { dry: args.iter().any(|a| a == "--dry"), ..Default::default() };
+    let mut opt = DailyOptions {
+        dry: args.iter().any(|a| a == "--dry"),
+        history: args.iter().any(|a| a == "--history"),
+        ..Default::default()
+    };
     if let Some(m) = flag("--delay-max-min").and_then(|s| s.parse::<u64>().ok()) {
         opt.start_delay_max_s = m * 60;
     }

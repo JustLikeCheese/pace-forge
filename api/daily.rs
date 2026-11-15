@@ -62,11 +62,13 @@ pub struct DailyOptions {
     pub km: Option<f64>,
     /// 指定时长（分钟），None = 按随机配速算。
     pub min: Option<f64>,
+    /// 跑完顺手拉历史记录（含轨迹）。
+    pub history: bool,
 }
 
 impl Default for DailyOptions {
     fn default() -> Self {
-        Self { dry: false, start_delay_max_s: 0, gap_s: (60, 240), only: Vec::new(), km: None, min: None }
+        Self { dry: false, start_delay_max_s: 0, gap_s: (60, 240), only: Vec::new(), km: None, min: None, history: false }
     }
 }
 
@@ -214,7 +216,17 @@ fn run_one(index: usize, acc: &DailyAccount, home: (f64, f64), opt: &DailyOption
         }
     };
 
-    // ③ 退出登录
+    // ③ 顺手拉历史记录和轨迹（复用这次登录，面板「账号历史」直接读）
+    let mut out = out;
+    if opt.history {
+        let mut h = json!({"records": []});
+        super::history::fill(&client, &mut h, 20, &tag);
+        if h.get("error_code").is_none() {
+            out["history"] = h;
+        }
+    }
+
+    // ④ 退出登录
     logout_account(&mut client, &tag);
     out
 }

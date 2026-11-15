@@ -118,6 +118,23 @@ fn clean(client: &Client, r: &Value) -> Value {
     o
 }
 
+/// 用已登录的会话拉最近 size 条记录（含轨迹），写进 out 的 records/total；失败写 error_code。
+/// daily 跑完顺手调它，省一次登录。
+pub fn fill(client: &Client, out: &mut Value, size: u32, tag: &str) {
+    match records::list_records(client, 1, size.clamp(1, 50), 1) {
+        Ok(list) => {
+            let rows = list["records"].as_array().cloned().unwrap_or_default();
+            out["records"] = Value::Array(rows.iter().map(|r| clean(client, r)).collect());
+            out["total"] = list["total"].clone();
+            println!("{tag} √ 拉到 {} 条历史记录", rows.len());
+        }
+        Err(e) => {
+            println!("{tag} ⚠ 拉历史记录失败：{e}");
+            out["error_code"] = json!(if e.contains("超时") || e.contains("Connection") { "network_failure" } else { "run_failed" });
+        }
+    }
+}
+
 /// 登录第 index 个账号（1 起），拉最近 size 条记录及轨迹，退出登录。
 pub fn account_history(cfg: &DailyConfig, index: usize, size: u32) -> Value {
     let Some(acc) = index.checked_sub(1).and_then(|i| cfg.accounts.get(i)) else {
@@ -135,18 +152,7 @@ pub fn account_history(cfg: &DailyConfig, index: usize, size: u32) -> Value {
             return out;
         }
     };
-    match records::list_records(&client, 1, size.clamp(1, 50), 1) {
-        Ok(list) => {
-            let rows = list["records"].as_array().cloned().unwrap_or_default();
-            out["records"] = Value::Array(rows.iter().map(|r| clean(&client, r)).collect());
-            out["total"] = list["total"].clone();
-            println!("{tag} √ {} 条记录", rows.len());
-        }
-        Err(e) => {
-            println!("{tag} × 拉记录失败：{e}");
-            out["error_code"] = json!(if e.contains("超时") || e.contains("Connection") { "network_failure" } else { "run_failed" });
-        }
-    }
+    fill(&client, &mut out, size, &tag);
     logout_account(&mut client, &tag);
     out
 }
