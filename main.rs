@@ -54,6 +54,7 @@ fn main() {
         "semester" => show_semester(),
         "daily" => do_daily(&args[1..]),
         "history" => do_history(&args[1..]),
+        "import-accounts" => do_import_accounts(),
         "export-ci" => do_export_ci(),
         "logout" => do_logout(),
         "relogin" => do_relogin(),
@@ -225,6 +226,58 @@ fn dry_run(dist_km: f64, dur_min: f64) {
 /// 完全离线的轨迹体检：不登录、不联网，只看本地合成的数据像不像真跑。
 /// 每日批量：账号从环境变量 `PACE_ACCOUNTS` 读，结果写 `--result`。
 /// 有账号失败时退出码 1（跳过不算失败）。
+/// import-accounts：把 PACE_ACCOUNTS 里的账号导进本机账号库（Web 页面用），
+/// 同时把各自的 device_id 固定下来，和 daily 是同一台"手机"。已有的账号只更新密码/名字。
+fn do_import_accounts() {
+    use pace_forge::api::{accounts, client::DeviceProfile, daily::DailyConfig, session};
+    let cfg: DailyConfig = match serde_json::from_str(&std::env::var("PACE_ACCOUNTS").unwrap_or_default()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("PACE_ACCOUNTS 缺失或格式不对: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut book = accounts::load();
+    let mut n = 0;
+    for a in &cfg.accounts {
+        let pw = match accounts::seal_password(&a.password) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("跳过一个账号：密码加密失败（{e}）");
+                continue;
+            }
+        };
+        if let Some(d) = a.device_id.as_deref() {
+            if let Err(e) = DeviceProfile::pin_device_id(&a.username, d) {
+                eprintln!("设备 ID 没固定：{e}");
+            }
+        }
+        let mut acc = book.by_username(&a.username).cloned().unwrap_or_else(|| accounts::Account {
+            id: a.username.clone(),
+            username: a.username.clone(),
+            enabled: true,
+            ..Default::default()
+        });
+        acc.password_enc = pw;
+        if let Some(nm) = a.name.as_deref().filter(|x| !x.is_empty()) {
+            acc.name = nm.to_string();
+        }
+        if let (Some(h), false) = (a.home, acc.uid.is_empty()) {
+            session::save_home(&acc.uid, h[0], h[1]);
+        }
+        book.upsert(acc);
+        n += 1;
+    }
+    if let Some(h) = cfg.home {
+        session::save_home("*", h[0], h[1]);
+    }
+    if let Err(e) = accounts::save(&book) {
+        eprintln!("保存账号库失败: {e}");
+        std::process::exit(1);
+    }
+    println!("导入 {n} 个账号");
+}
+
 /// history --index N [--size 20] --out 结果.json：拉某账号记录与轨迹（账号来自 PACE_ACCOUNTS）
 fn do_history(args: &[String]) {
     use pace_forge::api::{daily::DailyConfig, history::account_history};

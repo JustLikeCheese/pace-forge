@@ -280,7 +280,7 @@ $('btn').onclick = async () => {
   $('btn').disabled = true;
   setMsg('登录中…');
   try {
-    const me = await api('/api/login', {
+    const me = await api('api/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: u, password: p })
@@ -313,7 +313,7 @@ $('logout').onclick = async () => {
   btn.disabled = true;
   btn.textContent = '退出中…';
   try {
-    await fetch('/api/logout', { method: 'POST', cache: 'no-store' });
+    await fetch('api/logout', { method: 'POST', cache: 'no-store' });
   } catch (_) {}
   // 清掉本地残留，避免任何 form/地图状态带回来
   try { localStorage.clear(); sessionStorage.clear(); } catch (_) {}
@@ -436,7 +436,7 @@ $('planBtn').onclick = async () => {
   btn.disabled = true;
   setOut('生成中…');
   try {
-    const r = await api('/api/plan', {
+    const r = await api('api/plan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -506,7 +506,7 @@ $('semBtn').onclick = async () => {
   btn.disabled = true;
   $('semOut').innerHTML = '<div class="hint"><span class="spin"></span> 查询中…</div>';
   try {
-    const r = await api('/api/semester');
+    const r = await api('api/semester');
     if (r.summaryError) {
       $('semOut').innerHTML = `<div class="msg err">${r.summaryError}</div>`;
       return;
@@ -556,7 +556,7 @@ $('runBtn').onclick = async () => {
   btn.disabled = true;
   setOut('提交中，别关页面…');
   try {
-    const r = await api('/api/run', {
+    const r = await api('api/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -647,7 +647,7 @@ function drawPreview(coords, fence, checkpoints) {
 
 async function loadAccounts() {
   try {
-    const r = await api('/api/accounts');
+    const r = await api('api/accounts');
     renderAccounts(r);
     return r;
   } catch (e) {
@@ -691,7 +691,7 @@ async function accountAction(act, id) {
     if (act === 'del') {
       if (!confirm('删除这个账号？\n\n会先退出登录再删（不然服务端会话留活，下次登要锁一小时），存盘的密码也会一起删掉。\n\n只是想换账号的话，用旁边的「退出」——密码留着，随时重登。')) return;
       m.textContent = '退出登录中…';
-      const url = '/api/accounts/' + encodeURIComponent(id);
+      const url = 'api/accounts/' + encodeURIComponent(id);
       let r = await api(url, { method: 'DELETE' });
       // 服务端没确认退出时后端不会真删，先让用户知道后果再决定
       if (r.needConfirm) {
@@ -706,21 +706,21 @@ async function accountAction(act, id) {
         ? '已退出登录并删除'
         : (r.removed ? '已删除（服务端未确认退出，建议半小时内别重登）' : '已取消删除');
     } else if (act === 'switch') {
-      await api('/api/accounts/' + encodeURIComponent(id) + '/switch', { method: 'POST' });
+      await api('api/accounts/' + encodeURIComponent(id) + '/switch', { method: 'POST' });
       m.textContent = '已切换';
       await boot();
     } else if (act === 'login') {
       m.textContent = '登录中…';
-      const r = await api('/api/accounts/' + encodeURIComponent(id) + '/login', { method: 'POST' });
+      const r = await api('api/accounts/' + encodeURIComponent(id) + '/login', { method: 'POST' });
       m.textContent = '登录成功：' + (r.name || r.uid);
     } else if (act === 'logout') {
       // 退出登录：通知服务端让 token 失效，本地只清登录态，密码留着。
       // 不走这一步直接删账号的话，服务端会话还活着，账号仍被标记「已登录」，
       // 下次登录触发 10121 并锁一小时。
-      await api('/api/accounts/' + encodeURIComponent(id) + '/logout', { method: 'POST' });
+      await api('api/accounts/' + encodeURIComponent(id) + '/logout', { method: 'POST' });
       m.textContent = '已退出登录，密码已保留，随时可以重登';
     } else if (act === 'toggle') {
-      await api('/api/accounts/' + encodeURIComponent(id) + '/toggle', { method: 'POST' });
+      await api('api/accounts/' + encodeURIComponent(id) + '/toggle', { method: 'POST' });
       m.textContent = '';
     }
     m.className = 'msg';
@@ -753,7 +753,7 @@ async function resolveStartAt() {
   } else if (mode === 'rand') {
     qs.set('days', $('rDays').value || '0');
   }
-  const r = await api('/api/starttimes?' + qs.toString());
+  const r = await api('api/starttimes?' + qs.toString());
   if (r.clamped) {
     if (!confirm(`你选的时间会让结束时刻落在未来。\n\n已自动提前到：${r.startText}\n结束：${r.stopText}\n\n继续？`)) {
       throw new Error('已取消');
@@ -772,7 +772,7 @@ $('accAdd').onclick = async () => {
   m.textContent = '登录中（极验本地求解，可能要几秒）…';
   m.className = 'msg';
   try {
-    const r = await api('/api/accounts', {
+    const r = await api('api/accounts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: u, password: p })
@@ -797,7 +797,7 @@ $('accLoginAll').onclick = async () => {
   m.textContent = '批量登录中…';
   m.className = 'msg';
   try {
-    const r = await api('/api/accounts/login-all', { method: 'POST' });
+    const r = await api('api/accounts/login-all', { method: 'POST' });
     m.textContent = `完成：${r.ok}/${r.total} 个成功`;
     const bad = (r.results || []).filter(x => !x.ok);
     if (bad.length) {
@@ -836,7 +836,7 @@ $('accBatch').onclick = async () => {
   m.textContent = '批量提交中，别关页面…';
   m.className = 'msg';
   try {
-    const r = await api('/api/batch', {
+    const r = await api('api/batch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1044,7 +1044,7 @@ function setBlockMode(v) {
 
 async function loadBlockers() {
   try {
-    const r = await api('/api/blockers');
+    const r = await api('api/blockers');
     localBlockers = (r.polys || []).map(p => p.map(q => [q[0], q[1]]));
     drawBlockers();
   } catch (e) {
@@ -1064,7 +1064,7 @@ function initBlockers() {
   };
   $('blockSave').onclick = async () => {
     try {
-      const r = await api('/api/blockers', {
+      const r = await api('api/blockers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ polys: localBlockers }),
@@ -1162,7 +1162,7 @@ function initDrawing() {
 async function loadRecords() {
   $('list').innerHTML = '<div class="empty"><span class="spin"></span> 加载中…</div>';
   try {
-    const data = await api('/api/records?page=1&size=20&type=1');
+    const data = await api('api/records?page=1&size=20&type=1');
     const rows = pickRows(data);
     if (!rows.length) {
       $('list').innerHTML = '<div class="empty">这个学期还没有跑步记录</div>';
@@ -1257,7 +1257,7 @@ function obsKeys(rrid, uuid, startMs) {
 async function obsTrack(rrid, uuid, startMs) {
   for (const key of obsKeys(rrid, uuid, startMs)) {
     try {
-      const j = await api('/api/obs/fetch', { method: 'POST', body: JSON.stringify({ key }) });
+      const j = await api('api/obs/fetch', { method: 'POST', body: JSON.stringify({ key }) });
       const obj = j.data ?? j;
       if (!obj || !obj.run_data) continue;
       const wrap = JSON.parse(await ungzipB64(obj.run_data));
@@ -1279,7 +1279,7 @@ let homeCenter = null;
 async function goHome() {
   if (!map) return;
   if (!homeCenter) {
-    try { homeCenter = await api('/api/home'); } catch (_) { return; }
+    try { homeCenter = await api('api/home'); } catch (_) { return; }
   }
   if (homeCenter && homeCenter.lat) map.setView([homeCenter.lat, homeCenter.lng], 17);
 }
@@ -1294,7 +1294,7 @@ async function selectRec(r, el) {
   if (!rrid) { $('detail').textContent = '这条记录没有 rrid'; return; }
 
   try {
-    const d = await api('/api/record/' + rrid);
+    const d = await api('api/record/' + rrid);
     let pts = findTrack(d);
     // 服务端详情不带轨迹点（jsonFromObs=1 时 App 也去查手机本地库），
     // 但轨迹对象一直在 OBS 里：key 是 run_data/{rrid/1000000}/{rrid}.json。
@@ -1457,13 +1457,13 @@ function pace(km, sec) {
 /* ---------- 启动 ---------- */
 async function boot() {
   try {
-    const me = await api('/api/me');
+    const me = await api('api/me');
     enter(me);
     await loadAccounts();
   } catch (_) {
     // 未登录：如果库里有存过密码的账号，直接给个选择界面
     try {
-      const r = await api('/api/accounts');
+      const r = await api('api/accounts');
       const usable = (r.accounts || []).filter(a => a.hasPassword);
       if (usable.length) {
         showPicker(usable, r);
@@ -1498,7 +1498,7 @@ function showPicker(list, r) {
       m.textContent = '登录中…';
       m.className = 'msg';
       try {
-        const res = await api('/api/accounts/' + encodeURIComponent(b.dataset.id) + '/login', { method: 'POST' });
+        const res = await api('api/accounts/' + encodeURIComponent(b.dataset.id) + '/login', { method: 'POST' });
         box.style.display = 'none';
         $('picker').innerHTML = '';
         enter({ name: res.name, uid: res.uid });

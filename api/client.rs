@@ -74,6 +74,17 @@ impl DeviceProfile {
         d
     }
 
+    /// 把某账号的 device_id 固定成指定值（写进 `~/.pace-forge-device-id-*`），
+    /// 之后 `for_account(scope)` 就是这台"手机"。导入账号时用，和 daily 同一设备。
+    pub fn pin_device_id(scope: &str, device_id: &str) -> Result<(), String> {
+        if device_id.len() != 32 || !device_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("device_id 应为 32 位十六进制".into());
+        }
+        let dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let path = std::path::Path::new(&dir).join(format!(".pace-forge-device-id-{}", short_hash(scope)));
+        std::fs::write(&path, device_id).map_err(|e| format!("写 {} 失败: {e}", path.display()))
+    }
+
     /// 某账号在本机持久化的 device_id（没有就生成并落盘）。导出 CI 配置用。
     pub fn local_device_id(scope: &str) -> String {
         persistent_device_id(scope)
