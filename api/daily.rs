@@ -144,8 +144,24 @@ fn run_one(index: usize, acc: &DailyAccount, home: (f64, f64), opt: &DailyOption
     };
     let mut client = Client::new(device);
 
-    // ① 登录
-    match login::login(&mut client, &acc.username, &acc.password) {
+    // ① 登录。极验偶尔识别失败（缺口 distance=0 之类），整轮重登最多 3 次；
+    //    密码错、账号被锁（10121）不重试，免得把锁续上
+    let mut attempt = 1;
+    let outcome = loop {
+        let r = login::login(&mut client, &acc.username, &acc.password);
+        let retry = match &r {
+            Ok(LoginOutcome::NeedCaptcha { .. }) => true,
+            Err(e) => !(e.contains("10121") || e.contains("其他设备") || e.contains("密码")),
+            _ => false,
+        };
+        if !retry || attempt >= 3 {
+            break r;
+        }
+        println!("{tag} ⚠ 第 {attempt} 次登录没过，稍后重试");
+        attempt += 1;
+        std::thread::sleep(std::time::Duration::from_secs(rand_between(8, 20)));
+    };
+    match outcome {
         Ok(LoginOutcome::Ok(_)) => println!("{tag} √ 登录成功"),
         Ok(LoginOutcome::NeedCaptcha { message, .. }) => {
             println!("{tag} × 登录未过验证：{message}");
