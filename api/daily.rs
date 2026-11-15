@@ -58,11 +58,15 @@ pub struct DailyOptions {
     pub gap_s: (u64, u64),
     /// 只跑这些序号（1 起），空 = 全部。
     pub only: Vec<usize>,
+    /// 指定里程（km），None = 每个账号随机。
+    pub km: Option<f64>,
+    /// 指定时长（分钟），None = 按随机配速算。
+    pub min: Option<f64>,
 }
 
 impl Default for DailyOptions {
     fn default() -> Self {
-        Self { dry: false, start_delay_max_s: 0, gap_s: (60, 240), only: Vec::new() }
+        Self { dry: false, start_delay_max_s: 0, gap_s: (60, 240), only: Vec::new(), km: None, min: None }
     }
 }
 
@@ -200,9 +204,38 @@ fn run_one(index: usize, acc: &DailyAccount, home: (f64, f64), opt: &DailyOption
     out
 }
 
+/// 没指定的参数随机：里程 2.0~2.4km，时长按配速区间算；只给里程就配速随机，只给时长就里程随机。
+fn run_spec(seed: u64, km: Option<f64>, min: Option<f64>) -> (f64, f64) {
+    let (rk, rm) = flow::random_run_spec(seed);
+    match (km, min) {
+        (Some(k), Some(m)) => (k, m),
+        (Some(k), None) => (k, (k * (rm / rk) * 60.0).round() / 60.0),
+        (None, Some(m)) => (rk, m),
+        (None, None) => (rk, rm),
+    }
+}
+
+/// 轨迹抽稀到最多 n 个点，给面板画图用（坐标与 Pace Forge 地图同系）。
+fn thin_track(track: &[crate::track::TrackPoint], n: usize) -> Value {
+    if track.is_empty() {
+        return json!([]);
+    }
+    let step = (track.len() as f64 / n as f64).max(1.0);
+    let mut out = Vec::new();
+    let mut i = 0.0;
+    while (i as usize) < track.len() {
+        let p = &track[i as usize];
+        out.push(json!([(p.lat * 1e6).round() / 1e6, (p.lon * 1e6).round() / 1e6]));
+        i += step;
+    }
+    let l = track.last().unwrap();
+    out.push(json!([(l.lat * 1e6).round() / 1e6, (l.lon * 1e6).round() / 1e6]));
+    Value::Array(out)
+}
+
 fn run_submit(index: usize, client: &Client, home: (f64, f64), opt: &DailyOptions, tag: &str) -> Value {
     let seed = rand_u64();
-    let (km, min) = flow::random_run_spec(seed);
+    let (km, min) = run_spec(seed, opt.km, opt.min);
     let dur_s = (min * 60.0).round() as i64;
     println!("{tag} 计划 {km:.2}km / {}:{:02}{}", dur_s / 60, dur_s % 60, if opt.dry { "（预演）" } else { "" });
     let p = RunParams {
@@ -248,6 +281,7 @@ fn run_submit(index: usize, client: &Client, home: (f64, f64), opt: &DailyOption
                     "distance_m": o.real_length_m,
                     "duration_s": dur_s,
                     "steps": o.total_steps,
+                    "track": thin_track(&o.track, 160),
                 }),
             )
         }

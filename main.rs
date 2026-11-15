@@ -240,6 +240,15 @@ fn do_daily(args: &[String]) {
     if let Some(o) = flag("--only") {
         opt.only = o.split(',').filter_map(|x| x.trim().parse().ok()).collect();
     }
+    // 指定里程/时长；不给就随机
+    opt.km = flag("--km").and_then(|s| s.parse::<f64>().ok());
+    opt.min = flag("--min").and_then(|s| s.parse::<f64>().ok());
+    if let Some(k) = opt.km {
+        checked_km_min(k, 0.0);
+    }
+    if let Some(m) = opt.min {
+        checked_km_min(0.0, m);
+    }
     let raw = std::env::var("PACE_ACCOUNTS").unwrap_or_default();
     let cfg: DailyConfig = match serde_json::from_str(&raw) {
         Ok(c) => c,
