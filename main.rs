@@ -327,6 +327,9 @@ fn do_daily(args: &[String]) {
     if let Some(o) = flag("--only") {
         opt.only = o.split(',').filter_map(|x| x.trim().parse().ok()).collect();
     }
+    if let Some(m) = flag("--min-gap-min").and_then(|s| s.parse::<u64>().ok()) {
+        opt.min_gap_min = m;
+    }
     // 指定里程/时长；不给就随机
     opt.km = flag("--km").and_then(|s| s.parse::<f64>().ok());
     opt.min = flag("--min").and_then(|s| s.parse::<f64>().ok());

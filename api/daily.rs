@@ -64,11 +64,13 @@ pub struct DailyOptions {
     pub min: Option<f64>,
     /// 跑完顺手拉历史记录（含轨迹）。
     pub history: bool,
+    /// 这么多分钟内已有记录的账号跳过。
+    pub min_gap_min: u64,
 }
 
 impl Default for DailyOptions {
     fn default() -> Self {
-        Self { dry: false, start_delay_max_s: 0, gap_s: (60, 240), only: Vec::new(), km: None, min: None, history: false }
+        Self { dry: false, start_delay_max_s: 0, gap_s: (60, 240), only: Vec::new(), km: None, min: None, history: false, min_gap_min: 90 }
     }
 }
 
@@ -98,11 +100,6 @@ fn iso(ms: i64) -> String {
     )
 }
 
-/// 北京时间的"天"编号。
-fn cn_day(ms: i64) -> i64 {
-    (ms / 1000 + 8 * 3600).div_euclid(86_400)
-}
-
 fn rand_u64() -> u64 {
     use rand::RngCore;
     rand::thread_rng().next_u64()
@@ -116,14 +113,16 @@ fn rand_between(lo: u64, hi: u64) -> u64 {
 }
 
 /// 今天（北京时间）是否已有一条像样的记分跑记录。
-fn ran_today(client: &Client) -> Result<bool, String> {
+/// 最近 window_min 分钟内是否已有一条 ≥1km 的记录（一天跑多次，只防同一时段重复提交）。
+fn ran_recently(client: &Client, window_min: u64) -> Result<bool, String> {
     let v = super::records::list_records(client, 1, 5, 1)?;
-    let today = cn_day(now_ms());
+    let since = now_ms() - (window_min as i64) * 60_000;
     Ok(v["records"].as_array().is_some_and(|rs| {
         rs.iter().any(|r| {
             let st = r["startTime"].as_i64().unwrap_or(0);
+            let st = if st > 0 && st < 1_000_000_000_000 { st * 1000 } else { st };
             let dist = r["totalDistance"].as_f64().unwrap_or(0.0);
-            st > 0 && cn_day(st) == today && dist >= 1000.0
+            st >= since && dist >= 1000.0
         })
     }))
 }
@@ -202,10 +201,10 @@ fn run_one(index: usize, acc: &DailyAccount, home: (f64, f64), opt: &DailyOption
         Err(code) => return result(index, "failure", Some(code), json!({})),
     };
 
-    // ② 今天跑过就不再跑
-    let out = match ran_today(&client) {
+    // ② 最近刚跑过就不再跑（一天跑多次，只防同一时段重复提交）
+    let out = match ran_recently(&client, opt.min_gap_min) {
         Ok(true) => {
-            println!("{tag} · 今天已有记录，跳过");
+            println!("{tag} · {} 分钟内已有记录，跳过", opt.min_gap_min);
             result(index, "skipped", Some("already_done"), json!({}))
         }
         r => {
@@ -371,14 +370,6 @@ mod tests {
     fn iso_formats_utc() {
         assert_eq!(iso(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso(1_794_481_765_000), "2026-11-12T11:09:25Z");
-    }
-
-    #[test]
-    fn cn_day_rolls_at_utc16() {
-        // 北京时间 2026-11-13 00:00 = UTC 11-12 16:00
-        let before = 1_794_499_199_000; // UTC 11-12 15:59:59
-        let after = 1_794_499_200_000; // UTC 11-12 16:00:00
-        assert_eq!(cn_day(after) - cn_day(before), 1);
     }
 
     #[test]
