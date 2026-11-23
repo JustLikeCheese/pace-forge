@@ -96,14 +96,16 @@ impl DeviceProfile {
     /// 真机这些值从系统 API 读，一年都不会变；每次提交都换一茬等于自报
     /// 改机。安装时间用一个落在合理区间的固定值，也不用当前时间。
     fn fill_derived_identity(&mut self, seed: &str) {
+        // 真机 7.4.x 的 androidId/blMac/wifiMac/IMEI/CustomDeviceId 实测为空串
+        // （上游 issue #17：官方客户端 HAR 59/59 全空）。默认发空串和真机对齐；
+        // 需要旧的派生假值时设 PACE_HW_HEADERS=derived。
+        let empty_hw = std::env::var("PACE_HW_HEADERS").map(|v| v != "derived").unwrap_or(true);
         let h = |salt: &str| -> String {
             let mut hasher = Sha256::new();
             hasher.update(seed.as_bytes());
             hasher.update(salt.as_bytes());
             hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
         };
-        // 安卓 android_id 是 16 位小写 hex
-        self.android_id = h("android_id")[..16].to_string();
         self.custom_device_id = h("custom")[..32].to_string();
         // MAC 用本地管理位（第二字节 bit1 置 1），不对应真实网卡
         let mac = |salt: &str, sep: &str| -> String {
@@ -117,16 +119,21 @@ impl DeviceProfile {
             }
             b.join(sep)
         };
-        self.wifi_mac = mac("wifi", ":");
-        self.bl_mac = mac("bt", ":");
         self.mac_address = mac("nic", ":");
-        // IMEI 十五位数字，TAC 前缀取常见值
-        let digits: String = h("imei")
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .take(15)
-            .collect();
-        self.imei = format!("86{digits:0<13}");
+        if empty_hw {
+            // 真机这五项为空：androidId / blMac / wifiMac / IMEI / CustomDeviceId
+            self.android_id = String::new();
+            self.wifi_mac = String::new();
+            self.bl_mac = String::new();
+            self.imei = String::new();
+            self.custom_device_id = String::new();
+        } else {
+            self.android_id = h("android_id")[..16].to_string();
+            self.wifi_mac = mac("wifi", ":");
+            self.bl_mac = mac("bt", ":");
+            let digits: String = h("imei").chars().filter(|c| c.is_ascii_digit()).take(15).collect();
+            self.imei = format!("86{digits:0<13}");
+        }
         // 安装/更新时间：从 device_id 派生一个落在 2023-2024 的固定时刻
         let base = 1_690_000_000_000i64; // 2023-07
         let off: i64 = u32::from_str_radix(&h("inst")[..8], 16).unwrap_or(0) as i64;
@@ -138,7 +145,7 @@ impl DeviceProfile {
     fn base() -> Self {
         Self {
             device_id: String::new(),
-            app_version: "7.4.01".into(),
+            app_version: std::env::var("PACE_APP_VERSION").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "7.4.20".into()),
             physic_pixel: "1080x2400".into(),
             logic_pixel: "393x873".into(),
             is_root: "0".into(),
