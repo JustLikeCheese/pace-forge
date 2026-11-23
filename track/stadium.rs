@@ -205,20 +205,47 @@ pub fn campus_oval_track(
 
     let mut out: Vec<(f64, f64)> = Vec::with_capacity(n + 8);
 
-    // 入场尾巴：从跑道起点往场外偏 15~35m 的一点走进来。
+    // 入场：从场边 15~35m 的一点**弯着**并进跑道，并入时方向顺着跑步方向。
+    // 以前是一条没噪声的直线斜插进来，地图上一眼就是"尺子画的"。
+    // 三次贝塞尔：P0 场外起点 → P1 起步方向 → P2 跑道切线反向延长 → P3 跑道起点，
+    // 和跑道段共用同一串 OU 噪声，衔接处看不出断层。
     let start = point_at_dim(0.0, straight, radius, heading);
+    let ahead = point_at_dim(1.0, straight, radius, heading);
+    let (tx, ty) = {
+        let (dx, dy) = (ahead.0 - start.0, ahead.1 - start.1);
+        let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+        (dx / l, dy / l)
+    };
     let tail_len: f64 = rng.gen_range(15.0..35.0);
-    let tail_ang: f64 = rng.gen_range(0.0..std::f64::consts::TAU);
-    let entry = (
-        start.0 + tail_len * tail_ang.cos(),
-        start.1 + tail_len * tail_ang.sin(),
+    // 从跑道起点「身后、偏向一侧」进来，不会横穿到跑道对面
+    let side: f64 = if rng.gen::<bool>() { 1.0 } else { -1.0 };
+    let back = rng.gen_range(0.55..0.9);
+    let lat_off = rng.gen_range(0.35..0.8);
+    let p3 = start;
+    let p0 = (
+        start.0 - tx * tail_len * back - ty * side * tail_len * lat_off,
+        start.1 - ty * tail_len * back + tx * side * tail_len * lat_off,
     );
-    let tail_n = ((tail_len / sample_step_m).ceil() as usize).max(2);
+    let swing = rng.gen_range(-0.35..0.35);
+    let p1 = (
+        p0.0 + (p3.0 - p0.0) * 0.35 - ty * side * tail_len * swing,
+        p0.1 + (p3.1 - p0.1) * 0.35 + tx * side * tail_len * swing,
+    );
+    let p2 = (p3.0 - tx * tail_len * 0.45, p3.1 - ty * tail_len * 0.45);
+    let bez = |t: f64| {
+        let u = 1.0 - t;
+        let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+        (
+            a * p0.0 + b * p1.0 + c * p2.0 + d * p3.0,
+            a * p0.1 + b * p1.1 + c * p2.1 + d * p3.1,
+        )
+    };
+    let tail_n = ((tail_len * 1.15 / sample_step_m).ceil() as usize).max(3);
     for k in 0..tail_n {
-        let t = k as f64 / tail_n as f64;
-        let x = entry.0 + (start.0 - entry.0) * t;
-        let y = entry.1 + (start.1 - entry.1) * t;
-        out.push((center.0 + y / M_PER_DEG_LAT, center.1 + x / m_lng));
+        let (x, y) = bez(k as f64 / tail_n as f64);
+        jx += -theta * jx + sigma * gauss(&mut rng);
+        jy += -theta * jy + sigma * gauss(&mut rng);
+        out.push((center.0 + (y + jy) / M_PER_DEG_LAT, center.1 + (x + jx) / m_lng));
     }
 
     for i in 0..n {
@@ -363,5 +390,31 @@ mod tests {
             .map(|i| (30.5, 104.0 + i as f64 * 2e-4))
             .collect();
         assert!(!looks_like_stadium(&pts, 20.0));
+    }
+
+    /// 入场段不能是直线：中间点到首尾连线的最大偏离要有几米。
+    /// 设 PACE_DUMP_OVAL=路径 时顺便把轨迹写成 CSV 方便看图。
+    #[test]
+    fn oval_entry_is_curved() {
+        let spec = OvalSpec { straight: 85.0, radius: 36.0, heading: 0.3, laps: 5.6 };
+        for seed in 0..20u64 {
+            let pts = campus_oval_track((28.2, 112.9), &spec, 10.0, seed);
+            if seed == 3 {
+                if let Ok(p) = std::env::var("PACE_DUMP_OVAL") {
+                    let csv: String = pts.iter().map(|(a, b)| format!("{a},{b}
+")).collect();
+                    std::fs::write(p, csv).unwrap();
+                }
+            }
+            let m_lng = m_per_deg_lng(28.2);
+            let xy: Vec<(f64, f64)> = pts[..4].iter().map(|(la, ln)| ((ln - 112.9) * m_lng, (la - 28.2) * M_PER_DEG_LAT)).collect();
+            let (a, b) = (xy[0], xy[3]);
+            let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+            let dev = xy[1..3]
+                .iter()
+                .map(|p| ((b.0 - a.0) * (a.1 - p.1) - (a.0 - p.0) * (b.1 - a.1)).abs() / len.max(1e-9))
+                .fold(0.0, f64::max);
+            assert!(dev > 0.5, "seed {seed}: 入场段太直（偏离 {dev:.2}m）");
+        }
     }
 }
