@@ -26,13 +26,3 @@ pub use stadium::{
 pub use geo::{distance, path_length, sample_along, scale_to_length};
 pub use planner::{assign_times, plan, Checkpoint, PlanRequest, PlanResult, TrackPoint};
 
-/// 取 0.155 而不是 0.15：真机首段 86 秒 ÷ 555 秒 = 15.50%，差 3 秒就差一整个 20 秒窗口。
-pub const STARTUP_RATIO: f64 = 0.155;
-
-/// 起步窗口的秒数（segmentJson 首段时长 / state 分界）。
-pub fn startup_sec(total_sec: i64) -> i64 {
-    if total_sec <= 20 {
-        return 0;
-    }
-    ((total_sec as f64 * STARTUP_RATIO).round() as i64).clamp(5, total_sec / 2)
-}
