@@ -145,7 +145,7 @@ impl DeviceProfile {
     fn base() -> Self {
         Self {
             device_id: String::new(),
-            app_version: std::env::var("PACE_APP_VERSION").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "7.4.20".into()),
+            app_version: std::env::var("PACE_APP_VERSION").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "7.4.21".into()),
             physic_pixel: "1080x2400".into(),
             logic_pixel: "393x873".into(),
             is_root: "0".into(),
